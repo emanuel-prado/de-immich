@@ -74,10 +74,11 @@ backup + storage copy (read only)
  publish CSV and JSONL reports
 ```
 
-Path traversal, source symlinks, non-regular sources, missing COPY sections,
-missing required columns, and malformed field counts fail closed. Collision names
-are reserved so dry-run and export agree when they start from the same filesystem
-state. An interrupted run retains `manifest.jsonl.partial`.
+Path traversal, source or destination symlink components, non-regular sources,
+missing COPY sections, null asset IDs, missing required columns, and malformed
+field counts fail closed. Collision suffixes use bounded hashes rather than raw
+identifiers and are reserved so dry-run and export agree when they start from the
+same filesystem state. An interrupted run retains `manifest.jsonl.partial`.
 
 ## Remaining preservation safeguards
 
@@ -91,6 +92,9 @@ state. An interrupted run retains `manifest.jsonl.partial`.
 - Reports are sensitive because paths, identifiers, dates, and EXIF may identify
   people or places. Relative/redacted reporting needs an explicit schema change.
 - Sidecars and metadata sidecars need their own relationship and fixity fields.
+- The CLI assumes exclusive control of the output during a run. Its path checks
+  do not constitute a sandbox against a concurrent process racing filesystem
+  components between validation and use.
 
 These boundaries keep the project focused: serious preservation engineering can
 improve a small recovery tool without pretending it is an archival system.

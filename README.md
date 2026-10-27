@@ -27,10 +27,10 @@ and produces inspectable CSV and JSONL recovery reports.
 | Capability | Current behavior |
 | --- | --- |
 | Original recovery | Copies `asset.originalPath` using `originalFileName` |
-| Safe planning | Rejects traversal, symlink sources, malformed rows, and missing required schema |
-| Collisions | Reserves names within a run; dry-run and export use the same plan against the same starting state |
+| Safe planning | Rejects source/destination traversal, symlinked path components, malformed rows, and missing required schema |
+| Collisions | Uses bounded hashes of asset IDs and reserves names within a run; dry-run and export use the same plan against the same starting state |
 | Fixity | Records source/output SHA-256 and verifies the published copy |
-| Later verification | Re-reads exports with `--verify-manifest`; corruption or absence produces a nonzero status |
+| Later verification | Re-reads exports and rejects corruption, absence, symlink substitution, unsupported reports, and previously recorded copy failures |
 | Auditability | Records exported, missing, and skipped outcomes; retains a partial JSONL journal after interruption |
 | Metadata | Retains asset fields and available `asset_exif` fields without inventing values |
 | Related files | Supports historical dumps that contain `asset.sidecarPath`; can write per-asset JSON sidecars |
@@ -97,6 +97,8 @@ python3 de-immich.py --help
 
 - Source paths are contained within the configured root; traversal, source
   symlinks, and non-regular files fail closed.
+- Destination parents are checked for containment and symlinks, and untrusted
+  asset IDs are represented by bounded hash tokens in collision filenames.
 - Files are copied to a same-directory temporary file and published without an
   overwrite operation.
 - SHA-256 is calculated from bytes read from the source and independently from
@@ -104,7 +106,8 @@ python3 de-immich.py --help
 - Each completed outcome is synced to `manifest.jsonl.partial`. The partial file
   remains inspectable if the process stops before final reports are published.
 - Synthetic tests exercise SQL escapes/nulls, malformed schemas, paths,
-  collisions, missing files, dry-run planning, interruption, and corruption.
+  collisions, malicious IDs, output symlinks, missing files, dry-run planning,
+  interruption, corrupt reports, recorded fixity failures, and corruption.
 
 These safeguards have limits. A matching checksum shows that the exported bytes
 match the bytes read during recovery; it does not establish that the source was
@@ -141,6 +144,9 @@ location-related EXIF. Treat them as sensitive and redact before sharing.
   storage directory. External libraries need an explicit mapping design and are
   currently rejected rather than guessed.
 - Source symlinks are rejected even when they point back inside the storage root.
+- Filesystem checks prevent unsafe state observed during planning/copying; the
+  CLI is not designed to defend against another process concurrently replacing
+  path components during the operation.
 - EXIF rows and report rows are retained in memory, and the compressed dump is
   read multiple times. No scale/performance claim has been published.
 - Sidecars are not currently included in fixity fields.

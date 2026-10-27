@@ -5,12 +5,14 @@ while retaining enough evidence to inspect and independently verify the result.
 
 ## Completed foundation (pending review)
 
-- Contained internal storage paths; rejected traversal, symlinks, and non-files.
+- Contained internal source and output paths; rejected traversal, symlinked
+  components, and non-files; hashed untrusted IDs used in collision suffixes.
 - Required/validated `asset` and `asset_exif` COPY sections and row widths.
 - Reserved collisions consistently within dry-run and export.
 - Published files without overwriting existing paths.
 - Added synthetic tests for SQL escaping/nulls, malformed data, paths,
-  collisions, missing files, dry-run, interruption, and corruption.
+  collisions, malicious identifiers, output symlinks, missing files, dry-run,
+  interruption, invalid reports, recorded fixity failures, and corruption.
 - Recorded all normal skipped/missing/export outcomes in a synced journal.
 - Compared source/output SHA-256 and added later manifest verification.
 - Documented the versioned recovery report and its authenticity/privacy limits.

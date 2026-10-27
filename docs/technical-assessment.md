@@ -4,6 +4,26 @@ Assessment date: 2026-10-27. Scope: repository history through PRs #1–#4,
 application source, documentation, synthetic reproductions, and upstream
 specifications/source noted below.
 
+An adversarial follow-up review of the draft stack found and corrected additional
+issues before merge:
+
+- raw asset-ID prefixes in collision names allowed path separators to influence
+  the destination; collision tokens now use bounded SHA-256 text;
+- an existing symlinked year/month output directory could redirect writes outside
+  the export; destination parents are now contained and checked;
+- null asset IDs disappeared silently, and non-file sidecars were not rejected;
+- an unused unsafe sidecar reference could block original recovery;
+- later verification could print `OK` for a file whose report already recorded a
+  failed source/output comparison;
+- verification followed a substituted output symlink and accepted identical
+  target bytes;
+- the report schema documented a dry-run `planned` row that is never persisted.
+
+Regression tests now cover each corrected behavior. Filesystem checks assume the
+tool has exclusive control of its output; defending against a malicious process
+racing path components would require descriptor-relative filesystem operations
+and is not claimed.
+
 ## Findings that changed the plan
 
 The original single-file architecture was not itself the problem. Parsing,
