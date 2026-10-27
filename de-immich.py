@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import csv
 import gzip
+import hashlib
 import json
 import os
 import shutil
@@ -33,6 +34,13 @@ class BackupFormatError(ValueError):
 
 class UnsafePathError(ValueError):
     """Raised when a database path escapes the configured storage root."""
+
+
+def positive_int(raw: str) -> int:
+    value = int(raw)
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return value
 
 
 @dataclass
@@ -152,7 +160,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--limit",
-        type=int,
+        type=positive_int,
         help="Process at most N assets. Useful for testing.",
     )
     parser.add_argument(
@@ -396,18 +404,44 @@ def ensure_unique_destination(dest: Path, asset_id: str, reserved: Set[Path]) ->
 
     stem, suffix = split_name(dest.name)
     parent = dest.parent
-    candidate = parent / f"{stem}__{asset_id[:8]}{suffix}"
+    token = hashlib.sha256(asset_id.encode("utf-8")).hexdigest()[:12]
+    candidate = parent / f"{stem}__{token}{suffix}"
     if not candidate.exists() and candidate not in reserved:
         reserved.add(candidate)
         return candidate
 
     index = 2
     while True:
-        candidate = parent / f"{stem}__{asset_id[:8]}_{index}{suffix}"
+        candidate = parent / f"{stem}__{token}_{index}{suffix}"
         if not candidate.exists() and candidate not in reserved:
             reserved.add(candidate)
             return candidate
         index += 1
+
+
+def validate_destination(output_dir: Path, destination: Path) -> None:
+    root = output_dir.resolve()
+    try:
+        relative = destination.relative_to(root)
+    except ValueError as exc:
+        raise UnsafePathError(
+            f"Export destination escapes output directory: {destination}"
+        ) from exc
+
+    current = root
+    for part in relative.parts[:-1]:
+        current = current / part
+        if current.is_symlink():
+            raise UnsafePathError(
+                f"Export destination contains a symbolic link: {destination}"
+            )
+
+    try:
+        destination.parent.resolve(strict=False).relative_to(root)
+    except ValueError as exc:
+        raise UnsafePathError(
+            f"Export destination resolves outside output directory: {destination}"
+        ) from exc
 
 
 def copy_with_metadata(
@@ -536,7 +570,7 @@ def export_assets(args: argparse.Namespace) -> int:
 
         asset_id = asset.get("id")
         if not asset_id:
-            continue
+            raise BackupFormatError(f"Asset row {processed} has no id")
 
         if asset.get("deletedAt") and not args.include_deleted:
             stats.skipped_deleted += 1
@@ -556,7 +590,11 @@ def export_assets(args: argparse.Namespace) -> int:
 
         exif = exif_map.get(asset_id, {})
         source_path = resolve_storage_path(library_root, asset.get("originalPath"))
-        sidecar_source = resolve_storage_path(library_root, asset.get("sidecarPath"))
+        sidecar_source = (
+            resolve_storage_path(library_root, asset.get("sidecarPath"))
+            if args.copy_sidecars
+            else None
+        )
 
         if not source_path or not source_path.exists():
             stats.missing += 1
@@ -575,16 +613,22 @@ def export_assets(args: argparse.Namespace) -> int:
         final_dest = ensure_unique_destination(
             desired_dest, asset_id, reserved_destinations
         )
+        validate_destination(output_dir, final_dest)
         media_timestamp = choose_media_timestamp(asset, exif)
 
         copy_with_metadata(source_path, final_dest, media_timestamp, args.dry_run)
 
         sidecar_dest = None
         if args.copy_sidecars and sidecar_source and sidecar_source.exists():
+            if not sidecar_source.is_file():
+                raise UnsafePathError(
+                    f"Sidecar source is not a regular file: {sidecar_source}"
+                )
             sidecar_name = sanitize_filename(sidecar_source.name)
             sidecar_dest = ensure_unique_destination(
                 final_dest.parent / sidecar_name, asset_id, reserved_destinations
             )
+            validate_destination(output_dir, sidecar_dest)
             copy_with_metadata(
                 sidecar_source, sidecar_dest, media_timestamp, args.dry_run
             )
@@ -609,6 +653,7 @@ def export_assets(args: argparse.Namespace) -> int:
                     f"Refusing to overwrite existing metadata sidecar: {json_dest}"
                 )
             reserved_destinations.add(json_dest)
+            validate_destination(output_dir, json_dest)
             write_json(json_dest, row, args.dry_run)
 
         stats.exported += 1
