@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import csv
 import gzip
+import hashlib
 import json
 import os
 import shutil
@@ -12,7 +13,7 @@ import shutil as shutil_mod
 import sys
 import tempfile
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional, Set, Tuple
 
@@ -20,6 +21,8 @@ COPY_PREFIXES = {
     "asset": "COPY public.asset ",
     "asset_exif": "COPY public.asset_exif ",
 }
+TOOL_VERSION = "0.2.0"
+REPORT_SCHEMA_VERSION = "1.0"
 
 REQUIRED_COLUMNS = {
     "asset": {"id", "originalPath", "originalFileName"},
@@ -35,6 +38,10 @@ class UnsafePathError(ValueError):
     """Raised when a database path escapes the configured storage root."""
 
 
+class FixityError(IOError):
+    """Raised when content does not match its recorded checksum."""
+
+
 @dataclass
 class ExportStats:
     exported: int = 0
@@ -43,6 +50,8 @@ class ExportStats:
     skipped_offline: int = 0
     skipped_missing_name: int = 0
     sidecars_exported: int = 0
+    verified: int = 0
+    verification_failed: int = 0
 
 
 class ProgressReporter:
@@ -164,6 +173,11 @@ def parse_args() -> argparse.Namespace:
         "--no-progress",
         action="store_true",
         help="Disable progress output.",
+    )
+    parser.add_argument(
+        "--verify-manifest",
+        type=Path,
+        help="Verify exported files against SHA-256 values in a manifest.jsonl, then exit.",
     )
     return parser.parse_args()
 
@@ -399,19 +413,30 @@ def ensure_unique_destination(dest: Path, asset_id: str, reserved: Set[Path]) ->
         index += 1
 
 
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def copy_with_metadata(
     src: Path, dest: Path, timestamp: Optional[datetime], dry_run: bool
-) -> None:
+) -> Tuple[Optional[str], Optional[str]]:
     if dry_run:
-        return
+        return None, None
     dest.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=".de-immich-", suffix=".tmp", dir=dest.parent
     )
     temporary = Path(temporary_name)
+    source_digest = hashlib.sha256()
     try:
         with os.fdopen(descriptor, "wb") as output, src.open("rb") as source:
-            shutil.copyfileobj(source, output)
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                source_digest.update(chunk)
+                output.write(chunk)
         shutil.copystat(src, temporary)
         if timestamp:
             ts = timestamp.timestamp()
@@ -422,6 +447,9 @@ def copy_with_metadata(
             raise FileExistsError(f"Refusing to overwrite existing export: {dest}") from exc
     finally:
         temporary.unlink(missing_ok=True)
+    source_sha256 = source_digest.hexdigest()
+    exported_sha256 = sha256_file(dest)
+    return source_sha256, exported_sha256
 
 
 def write_json(path: Path, data: Dict[str, object], dry_run: bool) -> None:
@@ -450,9 +478,20 @@ def manifest_row(
     sidecar_source: Optional[Path],
     sidecar_exported: Optional[Path],
     status: str,
+    recovery_timestamp: str,
+    source_sha256: Optional[str] = None,
+    exported_sha256: Optional[str] = None,
+    verification: str = "not-performed",
 ) -> Dict[str, object]:
     data: Dict[str, object] = {
         "status": status,
+        "reportSchemaVersion": REPORT_SCHEMA_VERSION,
+        "toolVersion": TOOL_VERSION,
+        "recoveryTimestamp": recovery_timestamp,
+        "fixityAlgorithm": "sha256" if source_sha256 else None,
+        "sourceSha256": source_sha256,
+        "exportedSha256": exported_sha256,
+        "verification": verification,
         "assetId": asset.get("id"),
         "type": asset.get("type"),
         "originalFileName": asset.get("originalFileName"),
@@ -487,6 +526,50 @@ def manifest_row(
     return data
 
 
+def append_journal(path: Optional[Path], row: Dict[str, object]) -> None:
+    if path is None:
+        return
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(row, ensure_ascii=False))
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def verify_manifest(manifest_path: Path) -> int:
+    checked = 0
+    failures = 0
+    with manifest_path.open(encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, 1):
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise BackupFormatError(
+                    f"Invalid JSON on manifest line {line_number}: {exc.msg}"
+                ) from exc
+            expected = row.get("exportedSha256")
+            exported = row.get("exportedPath")
+            if not expected or not exported:
+                continue
+            checked += 1
+            path = Path(exported)
+            if not path.is_file():
+                failures += 1
+                print(f"FAIL missing: {path}")
+                continue
+            actual = sha256_file(path)
+            if actual != expected:
+                failures += 1
+                print(f"FAIL checksum: {path}")
+            else:
+                print(f"OK: {path}")
+    print(f"Files checked: {checked}")
+    print(f"Verification failures: {failures}")
+    return 2 if failures else 0
+
+
 def export_assets(args: argparse.Namespace) -> int:
     library_root = args.library_root.resolve()
     backup_path = (
@@ -504,18 +587,30 @@ def export_assets(args: argparse.Namespace) -> int:
     stats = ExportStats()
     progress = ProgressReporter(total_assets, enabled=not args.no_progress)
     manifest_csv_rows: List[Dict[str, object]] = []
-    manifest_jsonl_rows: List[Dict[str, object]] = []
     reserved_destinations: Set[Path] = set()
+    recovery_timestamp = datetime.now(timezone.utc).isoformat()
+    journal_path: Optional[Path] = None
 
     if not args.dry_run:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        journal_path = output_dir / "manifest.jsonl.partial"
         existing_manifests = [
             path
-            for path in (output_dir / "manifest.csv", output_dir / "manifest.jsonl")
+            for path in (
+                output_dir / "manifest.csv",
+                output_dir / "manifest.jsonl",
+                journal_path,
+            )
             if path.exists()
         ]
         if existing_manifests:
             names = ", ".join(str(path) for path in existing_manifests)
             raise FileExistsError(f"Refusing to overwrite existing manifest: {names}")
+        journal_path.touch(exist_ok=False)
+
+    def record(row: Dict[str, object]) -> None:
+        manifest_csv_rows.append(row)
+        append_journal(journal_path, row)
 
     processed = 0
     for asset in iter_copy_rows(backup_path, "asset"):
@@ -529,17 +624,53 @@ def export_assets(args: argparse.Namespace) -> int:
 
         if asset.get("deletedAt") and not args.include_deleted:
             stats.skipped_deleted += 1
+            record(
+                manifest_row(
+                    asset,
+                    exif_map.get(asset_id, {}),
+                    None,
+                    None,
+                    None,
+                    None,
+                    "skipped-deleted",
+                    recovery_timestamp,
+                )
+            )
             progress.update(processed, stats)
             continue
 
         if asset.get("isOffline") == "t" and not args.include_offline:
             stats.skipped_offline += 1
+            record(
+                manifest_row(
+                    asset,
+                    exif_map.get(asset_id, {}),
+                    None,
+                    None,
+                    None,
+                    None,
+                    "skipped-offline",
+                    recovery_timestamp,
+                )
+            )
             progress.update(processed, stats)
             continue
 
         original_name = asset.get("originalFileName")
         if not original_name:
             stats.skipped_missing_name += 1
+            record(
+                manifest_row(
+                    asset,
+                    exif_map.get(asset_id, {}),
+                    None,
+                    None,
+                    None,
+                    None,
+                    "skipped-missing-name",
+                    recovery_timestamp,
+                )
+            )
             progress.update(processed, stats)
             continue
 
@@ -550,10 +681,16 @@ def export_assets(args: argparse.Namespace) -> int:
         if not source_path or not source_path.exists():
             stats.missing += 1
             row = manifest_row(
-                asset, exif, source_path, None, sidecar_source, None, "missing-source"
+                asset,
+                exif,
+                source_path,
+                None,
+                sidecar_source,
+                None,
+                "missing-source",
+                recovery_timestamp,
             )
-            manifest_csv_rows.append(row)
-            manifest_jsonl_rows.append(row)
+            record(row)
             progress.update(processed, stats)
             continue
         if not source_path.is_file():
@@ -566,7 +703,19 @@ def export_assets(args: argparse.Namespace) -> int:
         )
         media_timestamp = choose_media_timestamp(asset, exif)
 
-        copy_with_metadata(source_path, final_dest, media_timestamp, args.dry_run)
+        source_sha256, exported_sha256 = copy_with_metadata(
+            source_path, final_dest, media_timestamp, args.dry_run
+        )
+        verification = "not-performed"
+        status = "planned" if args.dry_run else "exported"
+        if source_sha256 is not None:
+            if source_sha256 == exported_sha256:
+                verification = "verified"
+                stats.verified += 1
+            else:
+                verification = "failed"
+                status = "verification-failed"
+                stats.verification_failed += 1
 
         sidecar_dest = None
         if args.copy_sidecars and sidecar_source and sidecar_source.exists():
@@ -586,10 +735,13 @@ def export_assets(args: argparse.Namespace) -> int:
             final_dest,
             sidecar_source,
             sidecar_dest,
-            "exported",
+            status,
+            recovery_timestamp,
+            source_sha256,
+            exported_sha256,
+            verification,
         )
-        manifest_csv_rows.append(row)
-        manifest_jsonl_rows.append(row)
+        record(row)
 
         if args.write_json_sidecars:
             json_dest = final_dest.with_suffix(final_dest.suffix + ".immich.json")
@@ -604,7 +756,6 @@ def export_assets(args: argparse.Namespace) -> int:
         progress.update(processed, stats)
 
     if not args.dry_run:
-        output_dir.mkdir(parents=True, exist_ok=True)
         csv_path = output_dir / "manifest.csv"
         jsonl_path = output_dir / "manifest.jsonl"
 
@@ -614,10 +765,10 @@ def export_assets(args: argparse.Namespace) -> int:
             writer.writeheader()
             writer.writerows(manifest_csv_rows)
 
-        with jsonl_path.open("x", encoding="utf-8") as handle:
-            for row in manifest_jsonl_rows:
-                handle.write(json.dumps(row, ensure_ascii=False))
-                handle.write("\n")
+        if journal_path is None:
+            raise RuntimeError("Recovery journal was not initialized")
+        os.link(journal_path, jsonl_path)
+        journal_path.unlink()
 
     print(f"Library root: {library_root}")
     print(f"Backup: {backup_path}")
@@ -628,16 +779,20 @@ def export_assets(args: argparse.Namespace) -> int:
     print(f"Skipped offline: {stats.skipped_offline}")
     print(f"Skipped missing name: {stats.skipped_missing_name}")
     print(f"Sidecars exported: {stats.sidecars_exported}")
+    print(f"Files verified: {stats.verified}")
+    print(f"Verification failures: {stats.verification_failed}")
     if args.dry_run:
         print("Dry-run only: no files were copied and no manifests were written.")
     progress.finish(processed, stats)
 
-    return 0
+    return 2 if stats.verification_failed else 0
 
 
 def main() -> int:
     args = parse_args()
     try:
+        if args.verify_manifest:
+            return verify_manifest(args.verify_manifest.resolve())
         return export_assets(args)
     except BrokenPipeError:
         return 1

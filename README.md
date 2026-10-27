@@ -76,6 +76,12 @@ Dry run:
 python3 de-immich.py --dry-run
 ```
 
+Verify the SHA-256 checksums recorded by a completed export:
+
+```bash
+python3 de-immich.py --verify-manifest /path/to/immich-export/manifest.jsonl
+```
+
 Test with a small subset:
 
 ```bash
@@ -101,6 +107,9 @@ When not in `--dry-run` mode, it also writes:
 - `manifest.jsonl`
 
 These manifests include source paths, exported paths, timestamps, and copied EXIF-related metadata where available.
+They also include SHA-256 source/output checksums, verification outcomes, tool and
+report versions, and individual skipped/missing outcomes. See the
+[recovery report schema](docs/recovery-report.md) for field meanings and limits.
 
 ## How Path Resolution Works
 
