@@ -139,6 +139,21 @@ class ExportTests(unittest.TestCase):
         ):
             self.app.verify_manifest(manifest)
 
+    def test_manifest_verification_rejects_export_without_fixity(self):
+        manifest = self.root / "manifest.jsonl"
+        manifest.write_text(
+            json.dumps(
+                {"reportSchemaVersion": "1.0", "status": "exported"}
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(
+            self.app.BackupFormatError, "incomplete fixity record"
+        ):
+            self.app.verify_manifest(manifest)
+
     def test_manifest_verification_rejects_symlink_substitution(self):
         backup = self._collision_backup()
         output = self.root / "export"
