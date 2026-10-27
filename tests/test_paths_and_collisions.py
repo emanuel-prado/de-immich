@@ -50,9 +50,37 @@ class PathAndCollisionTests(unittest.TestCase):
         second = self.app.ensure_unique_destination(desired, "bbbbbbbb-two", reserved)
         third = self.app.ensure_unique_destination(desired, "bbbbbbbb-three", reserved)
         self.assertEqual(first, desired)
-        self.assertEqual(second, self.root / "photo__bbbbbbbb.jpg")
-        self.assertEqual(third, self.root / "photo__bbbbbbbb_2.jpg")
+        token_two = self.app.hashlib.sha256(b"bbbbbbbb-two").hexdigest()[:12]
+        token_three = self.app.hashlib.sha256(b"bbbbbbbb-three").hexdigest()[:12]
+        self.assertEqual(second, self.root / f"photo__{token_two}.jpg")
+        self.assertEqual(third, self.root / f"photo__{token_three}.jpg")
         self.assertEqual(len(reserved), 3)
+
+    def test_collision_asset_id_cannot_create_path_components(self):
+        desired = self.root / "export" / "photo.jpg"
+        reserved = {desired}
+
+        collision = self.app.ensure_unique_destination(
+            desired, "../../outside", reserved
+        )
+
+        self.assertEqual(collision.parent, desired.parent)
+        self.assertNotIn("..", collision.parts)
+
+    def test_symlinked_output_parent_is_rejected(self):
+        output = self.root / "export"
+        outside = self.root / "outside"
+        output.mkdir()
+        outside.mkdir()
+        (output / "2026").symlink_to(outside, target_is_directory=True)
+
+        with self.assertRaisesRegex(self.app.UnsafePathError, "symbolic link"):
+            self.app.validate_destination(output, output / "2026/01/photo.jpg")
+
+    def test_limit_must_be_positive(self):
+        self.assertEqual(self.app.positive_int("2"), 2)
+        with self.assertRaises(self.app.argparse.ArgumentTypeError):
+            self.app.positive_int("0")
 
     def test_filename_sanitization(self):
         cases = (("../photo.jpg", ".._photo.jpg"), (r"folder\photo.jpg", "folder_photo.jpg"), ("\x00", "unnamed"))
@@ -63,4 +91,3 @@ class PathAndCollisionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
