@@ -600,6 +600,16 @@ def verify_manifest(manifest_path: Path) -> int:
                 )
             expected = row.get("exportedSha256")
             exported = row.get("exportedPath")
+            if row.get("status") in {"exported", "verification-failed"} and (
+                not expected or not exported or not row.get("sourceSha256")
+            ):
+                raise BackupFormatError(
+                    f"Manifest line {line_number} has an incomplete fixity record"
+                )
+            if bool(expected) != bool(exported):
+                raise BackupFormatError(
+                    f"Manifest line {line_number} has an incomplete export reference"
+                )
             if not expected or not exported:
                 continue
             if not isinstance(exported, str) or not isinstance(expected, str):

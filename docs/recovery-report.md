@@ -56,7 +56,8 @@ python3 de-immich.py --verify-manifest /path/to/export/manifest.jsonl
 The command returns exit status `2` if a file is missing, its current SHA-256
 differs, or the report already records a failed source/output comparison. It
 returns `1` for an invalid, unreadable, or unsupported report. Rows without an
-exported path and checksum are not verification candidates.
+exported path and checksum are not verification candidates unless their status
+claims an export; exported rows with incomplete fixity evidence are invalid.
 
 ## Privacy and portability
 
