@@ -123,6 +123,7 @@ Reports can reveal filesystem paths, owner/device identifiers, dates, and
 location-related EXIF. Treat them as sensitive and redact before sharing.
 
 - [Recovery report schema and status definitions](docs/recovery-report.md)
+- [Independent technical assessment and upstream evidence](docs/technical-assessment.md)
 - [Preservation concepts and design boundaries](docs/preservation-notes.md)
 - [Prioritized development roadmap](docs/roadmap.md)
 - [Engineering case study](docs/case-study.md)

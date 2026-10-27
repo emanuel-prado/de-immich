@@ -18,7 +18,9 @@ The utility:
 2. Recovers original filenames and selects dates from EXIF or database timestamps.
 3. Recreates the files in a human-friendly dated directory structure.
 4. Optionally copies sidecar files and emits JSON metadata alongside assets.
-5. Writes CSV and JSONL inventories containing original references, metadata, export paths, and recovery status for recovered/missing assets.
+5. Calculates and compares SHA-256 for source bytes and the published copy.
+6. Writes versioned CSV/JSONL reports for exported, missing, skipped, and
+   fixity-failed assets, with an incremental journal for interrupted runs.
 
 The implementation is deliberately a single-file CLI rather than another application that requires deployment or a database server.
 
@@ -28,19 +30,23 @@ The implementation is deliberately a single-file CLI rather than another applica
 - **Metadata management:** extracting descriptive and technical fields while maintaining links to the source system.
 - **Python and structured formats:** compressed SQL parsing, filesystems, CSV, JSONL, and EXIF-related metadata from source records.
 - **Pragmatic software design:** a small dependency-free tool for a clearly bounded recovery task.
-- **Digital-preservation thinking:** identification, provenance, portability, auditability, and an explicit plan for integrity verification.
+- **Digital-preservation engineering:** identification, provenance, copy fixity,
+  later verification, auditability, and explicit limits on authenticity claims.
 
 ## Tradeoffs and limitations
 
 - Requires both the backup and original media; it cannot reconstruct deleted or absent file contents.
 - Database parser currently expects specific Immich COPY sections; a compatibility matrix remains to be built.
 - Current manifests are a practical export inventory, **not** standards-conformant preservation records.
-- Checksum validation, resume semantics, path-safety hardening, and complete event auditing remain to be implemented.
+- Safe resume, external-library mapping, current-schema sidecar recovery, and a
+  complete preservation-event model remain to be implemented.
 - No published performance, scale, or recovery-success claims are made without measured evidence.
 
 ## Next steps
 
-The next engineering milestones are destination planning and safety, test fixtures, fixity checks, and machine-readable recovery events. The longer-term possibility is an optional independently validated BagIt package.
+The next milestones are fixture-backed Immich version compatibility, explicit
+external-library mappings, and verified resume semantics. BagIt remains deferred
+until transfer packaging is a demonstrated need.
 
 See [the project README](../README.md), [preservation notes](preservation-notes.md), and [roadmap](roadmap.md).
 

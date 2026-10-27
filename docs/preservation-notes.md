@@ -1,95 +1,96 @@
 # Preservation-oriented design notes
 
-This document explains the thinking behind `de-immich` as an exploratory **digital-preservation and metadata-recovery** project. It deliberately distinguishes what the tool currently does from preservation capabilities we want to add.
+`de-immich` is a recovery and preservation-preparation utility. The goal is an
+intelligible, verifiable export—not a general DAM, archival repository, OAIS
+implementation, or substitute for multiple tested backups.
 
-## Preservation question
+## Evidence produced today
 
-A successful recovery is not just a directory containing readable images. It should help answer:
-
-1. **What is this object?** Original identity, name, format, dates, and descriptive context.
-2. **Where did it come from?** Source collection, asset identifiers, and the metadata used to reconstruct it.
-3. **What happened to it?** Which extraction and copy operations took place, when, and with what result.
-4. **Is it intact?** Could the bytes be compared to a recorded checksum, now and later?
-5. **Can another system use it?** Open inventories, documented field semantics, portable paths and metadata.
-
-## Current evidence and metadata
-
-| Archival/DAM concern | Current de-immich fields or behavior | Caveat |
+| Concern | Current evidence | Important limit |
 | --- | --- | --- |
-| Identification | `assetId`, `originalFileName`, `type` | Immich IDs identify records inside the source system, not universal identifiers |
-| Descriptive / technical metadata | `exif_*`, timestamp fields, `type` | Limited to what the backup stores; not a normalized interchange schema |
-| Provenance | `originalPath`, `resolvedSourcePath`, `exportedPath`, `ownerId`, `libraryId` | Captures paths/relations but not a complete chain of custody |
-| Relationships | `sidecarPath`, `livePhotoVideoId`, `duplicateId`, `stackId` | Records reference IDs; does not reconstruct every relationship |
-| Recovery events | `status`, CLI summary | No timestamped event history, agent identity, or standardized event schema |
-| Fixity | Not implemented | Neither source nor output checksums are recorded or verified |
-| Portability | CSV/JSONL manifests; optional JSON sidecars | Contains environment-specific absolute paths; should support redacted/relative paths |
+| Identification | Immich asset ID, original filename, media type | Source-system IDs are not universal identifiers |
+| Descriptive/technical metadata | Asset fields and `exif_*` fields | Source values, not a normalized interchange record |
+| Provenance | Original/resolved/export paths, owner/library references, timestamp, tool version | Not a complete chain of custody |
+| Relationships | Sidecar, live-photo, duplicate, and stack reference IDs when present | References are retained, not fully reconstructed |
+| Recovery outcomes | Exported, missing, skipped, or fixity-failed per asset | Not a complete preservation-event history |
+| Fixity | Source/output SHA-256 and later manifest verification | Copy equivalence, not prior authenticity; sidecars excluded |
+| Portability | CSV and JSONL | Reports contain environment-specific absolute paths |
 
-## Standards as design references (not claims of compliance)
+The source checksum describes the bytes actually read during recovery. Matching
+source and output digests demonstrate that publication preserved that byte
+stream. They cannot prove when, how, or by whom the source was created, or that it
+was unaltered before recovery.
 
-### PREMIS: preservation objects and events
+## Standards inform decisions; they are not badges
 
-The [PREMIS Data Dictionary 3.0](https://www.loc.gov/standards/premis/v3/) distinguishes Objects, Events, Agents, and Rights. For a future provenance report, that provides useful questions:
+### PREMIS
 
-- **Object:** Which file/asset was processed? What is its checksum and identifier?
-- **Event:** Was the file discovered, copied, verified, skipped, or found missing? When?
-- **Agent:** Which version of the tool performed the action?
-- **Rights:** What usage or custody information exists? (Not currently tracked.)
+The [PREMIS Data Dictionary 3.0](https://www.loc.gov/standards/premis/v3/)
+distinguishes Objects, Events, Agents, and Rights. That model usefully prompts
+questions about the object processed, action performed, outcome, time, software
+agent, and fixity evidence.
 
-For now, the export manifest is **PREMIS-inspired at most**. It does not produce PREMIS XML, JSON, or a validated PREMIS representation.
+The project report is only **PREMIS-informed**. It does not serialize PREMIS,
+model Rights, identify external Agents, or express the richer Object/Event
+relationships required for a validated representation. Adding PREMIS-shaped
+field names without those semantics would make the report less honest.
 
-### BagIt: portable, verifiable packages
+### BagIt
 
-[BagIt (RFC 8493)](https://www.rfc-editor.org/rfc/rfc8493.html) describes a directory-based transfer package with file checksum manifests.
+[BagIt, RFC 8493](https://www.rfc-editor.org/rfc/rfc8493.html) defines a transfer
+package layout, payload manifests, tag files, and validation rules. An ordinary
+de-immich export is a working directory, not a bag, and its SHA-256 fields are not
+a substitute for that structure.
 
-A future optional `--bagit` output could package the recovered payload, manifest, and contextual metadata for transfer. Adding a file named `manifest-sha256.txt` alone would **not** make a valid bag; layout, required tags, tag manifests, and validation must follow the specification.
+BagIt is deliberately deferred. If users demonstrate a transfer-packaging need,
+an implementation must follow the RFC and pass an independent validator. Merely
+adding `manifest-sha256.txt` would not be compliant.
 
-### Metadata interoperability
+### Dublin Core and metadata crosswalks
 
-CSV and JSONL work well for analysis and migration, but currently expose source-system field names.
+No Dublin Core record is emitted. An original filename is not automatically a
+trustworthy `dc:title`, an owner UUID is not a `dc:creator`, and file/capture/
+database timestamps are not interchangeable `dc:date` values. A future crosswalk
+should map only semantically supported source fields, distinguish descriptive,
+technical, administrative, and preservation metadata, and cite every source
+field. Until then, Immich names plus the `exif_` prefix retain more provenance
+than a superficial normalization.
 
-A future documented crosswalk could separate:
-
-- **Descriptive metadata:** Human titles, dates, subjects, location where available.
-- **Technical metadata:** Media type, dimensions, encoding, capture metadata.
-- **Administrative metadata:** Source library, status, recovery timestamps.
-- **Preservation metadata:** Fixity values and event outcomes.
-
-Do not invent missing fields or silently normalize ambiguous date/time values. Track field provenance and mapping decisions.
-
-## Workflow to aim for
+## Implemented recovery sequence
 
 ```text
-Original backup + storage tree (read-only)
-                 |
-          Parse + validate
-                 |
-          Plan destinations
-                 |
-       Recover original objects
-                 |
-      Verify copy integrity / fixity
-                 |
-     Write auditable recovery events
-                 |
-      Export portable metadata
-                 |
-     Optional validated BagIt bag
+backup + storage copy (read only)
+             |
+      parse and validate
+             |
+ contain paths and reserve names
+             |
+   copy without overwriting
+             |
+ SHA-256 source/output comparison
+             |
+ sync per-asset outcome journal
+             |
+ publish CSV and JSONL reports
 ```
 
-The **implemented** subset today is SQL parsing, destination selection, copies, optional sidecars, and basic inventories. Validation, full event logging, fixity, and BagIt packaging are planned, not done.
+Path traversal, source symlinks, non-regular sources, missing COPY sections,
+missing required columns, and malformed field counts fail closed. Collision names
+are reserved so dry-run and export agree when they start from the same filesystem
+state. An interrupted run retains `manifest.jsonl.partial`.
 
-## Preservation safeguards before new features
+## Remaining preservation safeguards
 
-- Never overwrite or mutate backup/source media.
-- Contain all resolved input and output paths; reject traversal and unsafe symlinks.
-- Plan deterministic collision names and make `--dry-run` describe the actual intended operation.
-- Make reruns idempotent and resumable; verify previously exported content before trusting it.
-- Include **all outcomes**, including skipped and failed records, in the audit inventory.
-- Treat manifests as sensitive: paths and embedded EXIF can reveal personal information.
-- Verify claims with synthetic fixtures and explicit, versioned Immich compatibility tests.
+- Resume must verify prior output and reuse stable planned destinations; today a
+  prior report or partial journal causes a safe refusal.
+- External libraries need explicit recorded-root to local-root mappings. Guessing
+  arbitrary absolute paths is unsafe.
+- Named Immich release support requires fixtures captured from those releases.
+- Current Immich sidecars use `asset_file`; historical `asset.sidecarPath`
+  behavior must not be presented as current compatibility.
+- Reports are sensitive because paths, identifiers, dates, and EXIF may identify
+  people or places. Relative/redacted reporting needs an explicit schema change.
+- Sidecars and metadata sidecars need their own relationship and fixity fields.
 
-## Scope boundary
-
-This is a **recovery and preservation-preparation utility**, not a full DAM, catalog, records-management system, archival repository, or OAIS implementation. It is also not a substitute for maintaining multiple tested backups.
-
-That boundary is intentional: a small, comprehensible tool that exports intelligible data can itself be a meaningful contribution to digital preservation.
+These boundaries keep the project focused: serious preservation engineering can
+improve a small recovery tool without pretending it is an archival system.
