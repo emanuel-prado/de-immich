@@ -28,6 +28,15 @@ class SqlParserTests(unittest.TestCase):
         self.assertEqual(row["originalFileName"], "tab\tline\nslash\\.jpg")
         self.assertIsNone(row["deletedAt"])
 
+    def test_postgres_octal_and_hexadecimal_escapes(self):
+        self.assertEqual(
+            self.app.postgres_copy_unescape(r"photo\056jpg-\x41"),
+            "photo.jpg-A",
+        )
+
+    def test_non_octal_digit_is_not_consumed_as_octal(self):
+        self.assertEqual(self.app.postgres_copy_unescape(r"value\8"), "value8")
+
     def test_missing_copy_section_is_rejected(self):
         backup = self.root / "empty.sql.gz"
         with gzip.open(backup, "wt", encoding="utf-8") as handle:
@@ -54,4 +63,3 @@ class SqlParserTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
