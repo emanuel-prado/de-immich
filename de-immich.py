@@ -5,20 +5,41 @@ from __future__ import annotations
 import argparse
 import csv
 import gzip
+import hashlib
 import json
 import os
 import shutil
 import shutil as shutil_mod
 import sys
+import tempfile
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Tuple
+from typing import Dict, Iterator, List, Optional, Set, Tuple
 
 COPY_PREFIXES = {
     "asset": "COPY public.asset ",
     "asset_exif": "COPY public.asset_exif ",
 }
+TOOL_VERSION = "0.2.0"
+REPORT_SCHEMA_VERSION = "1.0"
+
+REQUIRED_COLUMNS = {
+    "asset": {"id", "originalPath", "originalFileName"},
+    "asset_exif": {"assetId"},
+}
+
+
+class BackupFormatError(ValueError):
+    """Raised when a dump cannot be safely interpreted."""
+
+
+class UnsafePathError(ValueError):
+    """Raised when a database path escapes the configured storage root."""
+
+
+class FixityError(IOError):
+    """Raised when content does not match its recorded checksum."""
 
 
 @dataclass
@@ -29,6 +50,8 @@ class ExportStats:
     skipped_offline: int = 0
     skipped_missing_name: int = 0
     sidecars_exported: int = 0
+    verified: int = 0
+    verification_failed: int = 0
 
 
 class ProgressReporter:
@@ -151,6 +174,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable progress output.",
     )
+    parser.add_argument(
+        "--verify-manifest",
+        type=Path,
+        help="Verify exported files against SHA-256 values in a manifest.jsonl, then exit.",
+    )
     return parser.parse_args()
 
 
@@ -162,8 +190,14 @@ def latest_backup(backups_dir: Path) -> Path:
 
 
 def normalize_header_columns(copy_line: str) -> List[str]:
-    columns = copy_line.split("(", 1)[1].split(")", 1)[0].split(", ")
-    return [column.strip('"') for column in columns]
+    try:
+        column_text = copy_line.split("(", 1)[1].split(")", 1)[0]
+    except IndexError as exc:
+        raise BackupFormatError(f"Malformed COPY header: {copy_line.rstrip()}") from exc
+    columns = [column.strip().strip('"') for column in column_text.split(",")]
+    if not columns or any(not column for column in columns):
+        raise BackupFormatError(f"Malformed COPY header: {copy_line.rstrip()}")
+    return columns
 
 
 def postgres_copy_unescape(value: str) -> str:
@@ -217,6 +251,10 @@ def postgres_copy_unescape(value: str) -> str:
 
 def parse_copy_row(line: str, columns: List[str]) -> Dict[str, Optional[str]]:
     parts = line.rstrip("\n").split("\t")
+    if len(parts) != len(columns):
+        raise BackupFormatError(
+            f"COPY row has {len(parts)} fields; expected {len(columns)}"
+        )
     row: Dict[str, Optional[str]] = {}
     for key, value in zip(columns, parts):
         if value == r"\N":
@@ -230,13 +268,19 @@ def iter_copy_rows(
     sql_gz_path: Path, table_name: str
 ) -> Iterator[Dict[str, Optional[str]]]:
     prefix = COPY_PREFIXES[table_name]
-    with gzip.open(sql_gz_path, "rt", encoding="utf-8", errors="replace") as handle:
+    with gzip.open(sql_gz_path, "rt", encoding="utf-8") as handle:
         columns: Optional[List[str]] = None
         in_copy = False
         for line in handle:
             if not in_copy:
                 if line.startswith(prefix):
                     columns = normalize_header_columns(line)
+                    missing = REQUIRED_COLUMNS[table_name].difference(columns)
+                    if missing:
+                        names = ", ".join(sorted(missing))
+                        raise BackupFormatError(
+                            f"COPY public.{table_name} is missing required columns: {names}"
+                        )
                     in_copy = True
                 continue
             if line.rstrip("\n") == r"\.":
@@ -244,22 +288,15 @@ def iter_copy_rows(
             if columns is None:
                 raise RuntimeError(f"Failed to parse columns for {table_name}")
             yield parse_copy_row(line, columns)
+        if in_copy:
+            raise BackupFormatError(
+                f"COPY public.{table_name} has no terminating \\. marker"
+            )
+        raise BackupFormatError(f"Backup has no COPY public.{table_name} section")
 
 
 def count_copy_rows(sql_gz_path: Path, table_name: str) -> int:
-    prefix = COPY_PREFIXES[table_name]
-    count = 0
-    with gzip.open(sql_gz_path, "rt", encoding="utf-8", errors="replace") as handle:
-        in_copy = False
-        for line in handle:
-            if not in_copy:
-                if line.startswith(prefix):
-                    in_copy = True
-                continue
-            if line.rstrip("\n") == r"\.":
-                return count
-            count += 1
-    return count
+    return sum(1 for _ in iter_copy_rows(sql_gz_path, table_name))
 
 
 def parse_timestamp(raw: Optional[str]) -> Optional[datetime]:
@@ -286,9 +323,12 @@ def choose_media_timestamp(
 
 
 def sanitize_filename(name: str) -> str:
-    clean = name.replace("/", "_").replace("\x00", "")
+    clean = "".join(
+        "" if char == "\x00" else "_" if char in "/\\" or ord(char) < 32 else char
+        for char in name
+    )
     clean = clean.strip()
-    return clean or "unnamed"
+    return clean if clean not in {"", ".", ".."} else "unnamed"
 
 
 def split_name(filename: str) -> Tuple[str, str]:
@@ -313,55 +353,110 @@ def resolve_storage_path(library_root: Path, db_path: Optional[str]) -> Optional
     if not db_path:
         return None
 
+    root = library_root.resolve()
     path = Path(db_path)
     if path.is_absolute():
         parts = path.parts
-        for candidate in ("upload", "thumbs", "encoded-video", "profile", "backups"):
+        for candidate in (
+            "upload",
+            "library",
+            "thumbs",
+            "encoded-video",
+            "profile",
+            "backups",
+        ):
             indexes = [idx for idx, part in enumerate(parts) if part == candidate]
             if indexes:
                 rel = Path(*parts[indexes[-1] :])
-                return library_root / rel
-        if len(parts) > 1:
-            rel = Path(*parts[1:])
-            return library_root / rel
-    return library_root / path
+                break
+        else:
+            raise UnsafePathError(
+                f"Absolute source path is not in a recognized Immich storage directory: {db_path}"
+            )
+    else:
+        rel = path
+
+    candidate = root / rel
+    current = root
+    for part in rel.parts:
+        current = current / part
+        if current.is_symlink():
+            raise UnsafePathError(f"Source path contains a symbolic link: {db_path}")
+
+    resolved = candidate.resolve(strict=False)
+    try:
+        resolved.relative_to(root)
+    except ValueError as exc:
+        raise UnsafePathError(f"Source path escapes library root: {db_path}") from exc
+
+    return candidate
 
 
-def ensure_unique_destination(dest: Path, asset_id: str) -> Path:
-    if not dest.exists():
+def ensure_unique_destination(dest: Path, asset_id: str, reserved: Set[Path]) -> Path:
+    if not dest.exists() and dest not in reserved:
+        reserved.add(dest)
         return dest
 
     stem, suffix = split_name(dest.name)
     parent = dest.parent
     candidate = parent / f"{stem}__{asset_id[:8]}{suffix}"
-    if not candidate.exists():
+    if not candidate.exists() and candidate not in reserved:
+        reserved.add(candidate)
         return candidate
 
     index = 2
     while True:
         candidate = parent / f"{stem}__{asset_id[:8]}_{index}{suffix}"
-        if not candidate.exists():
+        if not candidate.exists() and candidate not in reserved:
+            reserved.add(candidate)
             return candidate
         index += 1
 
 
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def copy_with_metadata(
     src: Path, dest: Path, timestamp: Optional[datetime], dry_run: bool
-) -> None:
+) -> Tuple[Optional[str], Optional[str]]:
     if dry_run:
-        return
+        return None, None
     dest.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(src, dest)
-    if timestamp:
-        ts = timestamp.timestamp()
-        os.utime(dest, (ts, ts))
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=".de-immich-", suffix=".tmp", dir=dest.parent
+    )
+    temporary = Path(temporary_name)
+    source_digest = hashlib.sha256()
+    try:
+        with os.fdopen(descriptor, "wb") as output, src.open("rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                source_digest.update(chunk)
+                output.write(chunk)
+        shutil.copystat(src, temporary)
+        if timestamp:
+            ts = timestamp.timestamp()
+            os.utime(temporary, (ts, ts))
+        try:
+            os.link(temporary, dest)
+        except FileExistsError as exc:
+            raise FileExistsError(f"Refusing to overwrite existing export: {dest}") from exc
+    finally:
+        temporary.unlink(missing_ok=True)
+    source_sha256 = source_digest.hexdigest()
+    exported_sha256 = sha256_file(dest)
+    return source_sha256, exported_sha256
 
 
 def write_json(path: Path, data: Dict[str, object], dry_run: bool) -> None:
     if dry_run:
         return
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as handle:
+    with path.open("x", encoding="utf-8") as handle:
         json.dump(data, handle, ensure_ascii=False, indent=2)
         handle.write("\n")
 
@@ -383,9 +478,20 @@ def manifest_row(
     sidecar_source: Optional[Path],
     sidecar_exported: Optional[Path],
     status: str,
+    recovery_timestamp: str,
+    source_sha256: Optional[str] = None,
+    exported_sha256: Optional[str] = None,
+    verification: str = "not-performed",
 ) -> Dict[str, object]:
     data: Dict[str, object] = {
         "status": status,
+        "reportSchemaVersion": REPORT_SCHEMA_VERSION,
+        "toolVersion": TOOL_VERSION,
+        "recoveryTimestamp": recovery_timestamp,
+        "fixityAlgorithm": "sha256" if source_sha256 else None,
+        "sourceSha256": source_sha256,
+        "exportedSha256": exported_sha256,
+        "verification": verification,
         "assetId": asset.get("id"),
         "type": asset.get("type"),
         "originalFileName": asset.get("originalFileName"),
@@ -420,6 +526,50 @@ def manifest_row(
     return data
 
 
+def append_journal(path: Optional[Path], row: Dict[str, object]) -> None:
+    if path is None:
+        return
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(row, ensure_ascii=False))
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def verify_manifest(manifest_path: Path) -> int:
+    checked = 0
+    failures = 0
+    with manifest_path.open(encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, 1):
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise BackupFormatError(
+                    f"Invalid JSON on manifest line {line_number}: {exc.msg}"
+                ) from exc
+            expected = row.get("exportedSha256")
+            exported = row.get("exportedPath")
+            if not expected or not exported:
+                continue
+            checked += 1
+            path = Path(exported)
+            if not path.is_file():
+                failures += 1
+                print(f"FAIL missing: {path}")
+                continue
+            actual = sha256_file(path)
+            if actual != expected:
+                failures += 1
+                print(f"FAIL checksum: {path}")
+            else:
+                print(f"OK: {path}")
+    print(f"Files checked: {checked}")
+    print(f"Verification failures: {failures}")
+    return 2 if failures else 0
+
+
 def export_assets(args: argparse.Namespace) -> int:
     library_root = args.library_root.resolve()
     backup_path = (
@@ -437,7 +587,30 @@ def export_assets(args: argparse.Namespace) -> int:
     stats = ExportStats()
     progress = ProgressReporter(total_assets, enabled=not args.no_progress)
     manifest_csv_rows: List[Dict[str, object]] = []
-    manifest_jsonl_rows: List[Dict[str, object]] = []
+    reserved_destinations: Set[Path] = set()
+    recovery_timestamp = datetime.now(timezone.utc).isoformat()
+    journal_path: Optional[Path] = None
+
+    if not args.dry_run:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        journal_path = output_dir / "manifest.jsonl.partial"
+        existing_manifests = [
+            path
+            for path in (
+                output_dir / "manifest.csv",
+                output_dir / "manifest.jsonl",
+                journal_path,
+            )
+            if path.exists()
+        ]
+        if existing_manifests:
+            names = ", ".join(str(path) for path in existing_manifests)
+            raise FileExistsError(f"Refusing to overwrite existing manifest: {names}")
+        journal_path.touch(exist_ok=False)
+
+    def record(row: Dict[str, object]) -> None:
+        manifest_csv_rows.append(row)
+        append_journal(journal_path, row)
 
     processed = 0
     for asset in iter_copy_rows(backup_path, "asset"):
@@ -451,17 +624,53 @@ def export_assets(args: argparse.Namespace) -> int:
 
         if asset.get("deletedAt") and not args.include_deleted:
             stats.skipped_deleted += 1
+            record(
+                manifest_row(
+                    asset,
+                    exif_map.get(asset_id, {}),
+                    None,
+                    None,
+                    None,
+                    None,
+                    "skipped-deleted",
+                    recovery_timestamp,
+                )
+            )
             progress.update(processed, stats)
             continue
 
         if asset.get("isOffline") == "t" and not args.include_offline:
             stats.skipped_offline += 1
+            record(
+                manifest_row(
+                    asset,
+                    exif_map.get(asset_id, {}),
+                    None,
+                    None,
+                    None,
+                    None,
+                    "skipped-offline",
+                    recovery_timestamp,
+                )
+            )
             progress.update(processed, stats)
             continue
 
         original_name = asset.get("originalFileName")
         if not original_name:
             stats.skipped_missing_name += 1
+            record(
+                manifest_row(
+                    asset,
+                    exif_map.get(asset_id, {}),
+                    None,
+                    None,
+                    None,
+                    None,
+                    "skipped-missing-name",
+                    recovery_timestamp,
+                )
+            )
             progress.update(processed, stats)
             continue
 
@@ -472,25 +681,47 @@ def export_assets(args: argparse.Namespace) -> int:
         if not source_path or not source_path.exists():
             stats.missing += 1
             row = manifest_row(
-                asset, exif, source_path, None, sidecar_source, None, "missing-source"
+                asset,
+                exif,
+                source_path,
+                None,
+                sidecar_source,
+                None,
+                "missing-source",
+                recovery_timestamp,
             )
-            manifest_csv_rows.append(row)
-            manifest_jsonl_rows.append(row)
+            record(row)
             progress.update(processed, stats)
             continue
+        if not source_path.is_file():
+            raise UnsafePathError(f"Source is not a regular file: {source_path}")
 
         subdir = export_subdir(asset, exif, args.flat)
         desired_dest = output_dir / subdir / sanitize_filename(original_name)
-        final_dest = ensure_unique_destination(desired_dest, asset_id)
+        final_dest = ensure_unique_destination(
+            desired_dest, asset_id, reserved_destinations
+        )
         media_timestamp = choose_media_timestamp(asset, exif)
 
-        copy_with_metadata(source_path, final_dest, media_timestamp, args.dry_run)
+        source_sha256, exported_sha256 = copy_with_metadata(
+            source_path, final_dest, media_timestamp, args.dry_run
+        )
+        verification = "not-performed"
+        status = "planned" if args.dry_run else "exported"
+        if source_sha256 is not None:
+            if source_sha256 == exported_sha256:
+                verification = "verified"
+                stats.verified += 1
+            else:
+                verification = "failed"
+                status = "verification-failed"
+                stats.verification_failed += 1
 
         sidecar_dest = None
         if args.copy_sidecars and sidecar_source and sidecar_source.exists():
             sidecar_name = sanitize_filename(sidecar_source.name)
             sidecar_dest = ensure_unique_destination(
-                final_dest.parent / sidecar_name, asset_id
+                final_dest.parent / sidecar_name, asset_id, reserved_destinations
             )
             copy_with_metadata(
                 sidecar_source, sidecar_dest, media_timestamp, args.dry_run
@@ -504,33 +735,40 @@ def export_assets(args: argparse.Namespace) -> int:
             final_dest,
             sidecar_source,
             sidecar_dest,
-            "exported",
+            status,
+            recovery_timestamp,
+            source_sha256,
+            exported_sha256,
+            verification,
         )
-        manifest_csv_rows.append(row)
-        manifest_jsonl_rows.append(row)
+        record(row)
 
         if args.write_json_sidecars:
             json_dest = final_dest.with_suffix(final_dest.suffix + ".immich.json")
+            if json_dest.exists() or json_dest in reserved_destinations:
+                raise FileExistsError(
+                    f"Refusing to overwrite existing metadata sidecar: {json_dest}"
+                )
+            reserved_destinations.add(json_dest)
             write_json(json_dest, row, args.dry_run)
 
         stats.exported += 1
         progress.update(processed, stats)
 
     if not args.dry_run:
-        output_dir.mkdir(parents=True, exist_ok=True)
         csv_path = output_dir / "manifest.csv"
         jsonl_path = output_dir / "manifest.jsonl"
 
         fieldnames = sorted({key for row in manifest_csv_rows for key in row.keys()})
-        with csv_path.open("w", newline="", encoding="utf-8") as handle:
+        with csv_path.open("x", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=fieldnames)
             writer.writeheader()
             writer.writerows(manifest_csv_rows)
 
-        with jsonl_path.open("w", encoding="utf-8") as handle:
-            for row in manifest_jsonl_rows:
-                handle.write(json.dumps(row, ensure_ascii=False))
-                handle.write("\n")
+        if journal_path is None:
+            raise RuntimeError("Recovery journal was not initialized")
+        os.link(journal_path, jsonl_path)
+        journal_path.unlink()
 
     print(f"Library root: {library_root}")
     print(f"Backup: {backup_path}")
@@ -541,16 +779,20 @@ def export_assets(args: argparse.Namespace) -> int:
     print(f"Skipped offline: {stats.skipped_offline}")
     print(f"Skipped missing name: {stats.skipped_missing_name}")
     print(f"Sidecars exported: {stats.sidecars_exported}")
+    print(f"Files verified: {stats.verified}")
+    print(f"Verification failures: {stats.verification_failed}")
     if args.dry_run:
         print("Dry-run only: no files were copied and no manifests were written.")
     progress.finish(processed, stats)
 
-    return 0
+    return 2 if stats.verification_failed else 0
 
 
 def main() -> int:
     args = parse_args()
     try:
+        if args.verify_manifest:
+            return verify_manifest(args.verify_manifest.resolve())
         return export_assets(args)
     except BrokenPipeError:
         return 1
