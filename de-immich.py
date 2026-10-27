@@ -233,15 +233,26 @@ def postgres_copy_unescape(value: str) -> str:
             out.append(mapping[esc])
             continue
 
-        if esc.isdigit():
+        if esc in "01234567":
             octal = esc
             for _ in range(2):
-                if i < len(value) and value[i].isdigit():
+                if i < len(value) and value[i] in "01234567":
                     octal += value[i]
                     i += 1
                 else:
                     break
             out.append(chr(int(octal, 8)))
+            continue
+
+        if esc == "x":
+            hexadecimal = ""
+            for _ in range(2):
+                if i < len(value) and value[i].lower() in "0123456789abcdef":
+                    hexadecimal += value[i]
+                    i += 1
+                else:
+                    break
+            out.append(chr(int(hexadecimal, 16)) if hexadecimal else "x")
             continue
 
         out.append(esc)
