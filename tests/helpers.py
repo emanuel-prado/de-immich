@@ -55,4 +55,3 @@ def write_backup(
     with gzip.open(path, "wt", encoding="utf-8") as handle:
         handle.write(text)
     return path
-

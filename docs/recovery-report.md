@@ -28,7 +28,6 @@ when the source was first acquired.
 
 - `exported`: copied and source/output SHA-256 values matched.
 - `verification-failed`: copied, but the independently read output did not match.
-- `planned`: included in a dry run; no bytes were copied or hashed.
 - `missing-source`: the database record resolved to a path that was absent.
 - `skipped-deleted`: omitted because Immich marked the asset deleted.
 - `skipped-offline`: omitted because Immich marked the asset offline.
@@ -54,9 +53,10 @@ Re-read every exported file that has a recorded checksum:
 python3 de-immich.py --verify-manifest /path/to/export/manifest.jsonl
 ```
 
-The command returns exit status `2` if a file is missing or its SHA-256 differs,
-and `1` for an invalid/unreadable report. Rows without an exported path and
-checksum are not verification candidates.
+The command returns exit status `2` if a file is missing, its current SHA-256
+differs, or the report already records a failed source/output comparison. It
+returns `1` for an invalid, unreadable, or unsupported report. Rows without an
+exported path and checksum are not verification candidates.
 
 ## Privacy and portability
 
@@ -66,4 +66,3 @@ backup. Treat them as sensitive and redact them before sharing. Absolute paths
 also make the report environment-specific; a future schema may add relative
 package paths without removing the original source references needed for local
 recovery auditing.
-

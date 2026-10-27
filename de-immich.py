@@ -38,8 +38,11 @@ class UnsafePathError(ValueError):
     """Raised when a database path escapes the configured storage root."""
 
 
-class FixityError(IOError):
-    """Raised when content does not match its recorded checksum."""
+def positive_int(raw: str) -> int:
+    value = int(raw)
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return value
 
 
 @dataclass
@@ -161,7 +164,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--limit",
-        type=int,
+        type=positive_int,
         help="Process at most N assets. Useful for testing.",
     )
     parser.add_argument(
@@ -410,14 +413,15 @@ def ensure_unique_destination(dest: Path, asset_id: str, reserved: Set[Path]) ->
 
     stem, suffix = split_name(dest.name)
     parent = dest.parent
-    candidate = parent / f"{stem}__{asset_id[:8]}{suffix}"
+    token = hashlib.sha256(asset_id.encode("utf-8")).hexdigest()[:12]
+    candidate = parent / f"{stem}__{token}{suffix}"
     if not candidate.exists() and candidate not in reserved:
         reserved.add(candidate)
         return candidate
 
     index = 2
     while True:
-        candidate = parent / f"{stem}__{asset_id[:8]}_{index}{suffix}"
+        candidate = parent / f"{stem}__{token}_{index}{suffix}"
         if not candidate.exists() and candidate not in reserved:
             reserved.add(candidate)
             return candidate
@@ -430,6 +434,31 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def validate_destination(output_dir: Path, destination: Path) -> None:
+    root = output_dir.resolve()
+    try:
+        relative = destination.relative_to(root)
+    except ValueError as exc:
+        raise UnsafePathError(
+            f"Export destination escapes output directory: {destination}"
+        ) from exc
+
+    current = root
+    for part in relative.parts[:-1]:
+        current = current / part
+        if current.is_symlink():
+            raise UnsafePathError(
+                f"Export destination contains a symbolic link: {destination}"
+            )
+
+    try:
+        destination.parent.resolve(strict=False).relative_to(root)
+    except ValueError as exc:
+        raise UnsafePathError(
+            f"Export destination resolves outside output directory: {destination}"
+        ) from exc
 
 
 def copy_with_metadata(
@@ -560,20 +589,62 @@ def verify_manifest(manifest_path: Path) -> int:
                 raise BackupFormatError(
                     f"Invalid JSON on manifest line {line_number}: {exc.msg}"
                 ) from exc
+            if not isinstance(row, dict):
+                raise BackupFormatError(
+                    f"Manifest line {line_number} is not a JSON object"
+                )
+            if row.get("reportSchemaVersion") != REPORT_SCHEMA_VERSION:
+                raise BackupFormatError(
+                    f"Manifest line {line_number} has unsupported report schema: "
+                    f"{row.get('reportSchemaVersion')!r}"
+                )
             expected = row.get("exportedSha256")
             exported = row.get("exportedPath")
             if not expected or not exported:
                 continue
+            if not isinstance(exported, str) or not isinstance(expected, str):
+                raise BackupFormatError(
+                    f"Manifest line {line_number} has non-string fixity fields"
+                )
+            if len(expected) != 64 or any(
+                character not in "0123456789abcdef" for character in expected
+            ):
+                raise BackupFormatError(
+                    f"Manifest line {line_number} has an invalid SHA-256 value"
+                )
             checked += 1
             path = Path(exported)
-            if not path.is_file():
+            reasons: List[str] = []
+            source_sha256 = row.get("sourceSha256")
+            if source_sha256 is not None and (
+                not isinstance(source_sha256, str)
+                or len(source_sha256) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in source_sha256
+                )
+            ):
+                raise BackupFormatError(
+                    f"Manifest line {line_number} has an invalid source SHA-256 value"
+                )
+            if (
+                row.get("verification") == "failed"
+                or row.get("status") == "verification-failed"
+            ):
+                reasons.append("recorded copy verification failed")
+            if source_sha256 and source_sha256 != expected:
+                reasons.append("recorded source/output checksums differ")
+            if path.is_symlink():
+                reasons.append("export was replaced by a symbolic link")
+            elif not path.is_file():
+                reasons.append("export is missing")
+            else:
+                actual = sha256_file(path)
+                if actual != expected:
+                    reasons.append("current checksum differs")
+            if reasons:
                 failures += 1
-                print(f"FAIL missing: {path}")
-                continue
-            actual = sha256_file(path)
-            if actual != expected:
-                failures += 1
-                print(f"FAIL checksum: {path}")
+                print(f"FAIL: {path}: {'; '.join(reasons)}")
             else:
                 print(f"OK: {path}")
     print(f"Files checked: {checked}")
@@ -631,7 +702,7 @@ def export_assets(args: argparse.Namespace) -> int:
 
         asset_id = asset.get("id")
         if not asset_id:
-            continue
+            raise BackupFormatError(f"Asset row {processed} has no id")
 
         if asset.get("deletedAt") and not args.include_deleted:
             stats.skipped_deleted += 1
@@ -687,7 +758,11 @@ def export_assets(args: argparse.Namespace) -> int:
 
         exif = exif_map.get(asset_id, {})
         source_path = resolve_storage_path(library_root, asset.get("originalPath"))
-        sidecar_source = resolve_storage_path(library_root, asset.get("sidecarPath"))
+        sidecar_source = (
+            resolve_storage_path(library_root, asset.get("sidecarPath"))
+            if args.copy_sidecars
+            else None
+        )
 
         if not source_path or not source_path.exists():
             stats.missing += 1
@@ -712,6 +787,7 @@ def export_assets(args: argparse.Namespace) -> int:
         final_dest = ensure_unique_destination(
             desired_dest, asset_id, reserved_destinations
         )
+        validate_destination(output_dir, final_dest)
         media_timestamp = choose_media_timestamp(asset, exif)
 
         source_sha256, exported_sha256 = copy_with_metadata(
@@ -730,10 +806,15 @@ def export_assets(args: argparse.Namespace) -> int:
 
         sidecar_dest = None
         if args.copy_sidecars and sidecar_source and sidecar_source.exists():
+            if not sidecar_source.is_file():
+                raise UnsafePathError(
+                    f"Sidecar source is not a regular file: {sidecar_source}"
+                )
             sidecar_name = sanitize_filename(sidecar_source.name)
             sidecar_dest = ensure_unique_destination(
                 final_dest.parent / sidecar_name, asset_id, reserved_destinations
             )
+            validate_destination(output_dir, sidecar_dest)
             copy_with_metadata(
                 sidecar_source, sidecar_dest, media_timestamp, args.dry_run
             )
@@ -761,6 +842,7 @@ def export_assets(args: argparse.Namespace) -> int:
                     f"Refusing to overwrite existing metadata sidecar: {json_dest}"
                 )
             reserved_destinations.add(json_dest)
+            validate_destination(output_dir, json_dest)
             write_json(json_dest, row, args.dry_run)
 
         stats.exported += 1
