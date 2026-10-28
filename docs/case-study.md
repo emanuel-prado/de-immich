@@ -40,8 +40,8 @@ The implementation is deliberately a single-file CLI rather than another applica
   v3.3.5 has one end-to-end synthetic validation; a multi-version compatibility
   matrix remains to be built.
 - Current manifests are a practical export inventory, **not** standards-conformant preservation records.
-- Safe resume, external-library mapping, current-schema sidecar recovery, and a
-  complete preservation-event model remain to be implemented.
+- Safe resume, external-library mapping, generated-metadata-sidecar fixity, and
+  a complete preservation-event model remain to be implemented.
 - Path validation assumes no other process is concurrently replacing filesystem
   components during recovery; the utility is not an operating-system sandbox.
 - No published performance, scale, or recovery-success claims are made without measured evidence.

@@ -16,6 +16,8 @@ while retaining enough evidence to inspect and independently verify the result.
 - Recorded all normal skipped/missing/export outcomes in a synced journal.
 - Compared source/output SHA-256 and added later manifest verification.
 - Documented the versioned recovery report and its authenticity/privacy limits.
+- Recovered current `asset_file` XMP sidecars and recorded independent sidecar
+  fixity, validated against an API-created Immich v3.3.5 asset.
 
 GitHub Actions remains blocked by the current automation token's missing
 `workflow` scope. The suite itself has no third-party dependency and runs with:
@@ -39,7 +41,7 @@ trusts a modified prior output, with tests for both outcomes.
 ### 2. Evidence-backed Immich compatibility
 
 - Generate or anonymize dump shapes from named Immich releases without user data.
-- Add current `asset_file` sidecar relationships only with representative fixtures.
+- Extend named-version fixtures beyond the validated Immich v3.3.5 shape.
 - Detect unsupported shapes and publish a narrow compatibility matrix.
 
 **Done when:** every release claim cites a fixture and unsupported required
@@ -61,7 +63,6 @@ an unmapped absolute path.
 
 - Record backup identity, export options, start/end times, and aggregate outcomes.
 - Add relative destination paths and an explicit redaction mode.
-- Add fixity/relationship fields for copied sidecars.
 - Define schema migration and backwards-compatibility rules.
 
 ### 5. Metadata crosswalk only where semantics support it

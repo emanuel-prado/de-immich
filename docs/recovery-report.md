@@ -1,4 +1,4 @@
-# Recovery report schema 1.0
+# Recovery report schema 1.1
 
 Each export writes the same per-asset records to `manifest.csv` and
 `manifest.jsonl`. The JSON Lines representation is the canonical machine-readable
@@ -11,7 +11,7 @@ a BagIt manifest, or evidence that an export is an archival information package.
 
 | Field | Meaning |
 | --- | --- |
-| `reportSchemaVersion` | Version of this report contract, currently `1.0` |
+| `reportSchemaVersion` | Version of this report contract, currently `1.1` |
 | `toolVersion` | Version of de-immich that performed the recovery |
 | `recoveryTimestamp` | UTC timestamp shared by all records in one run |
 | `status` | Per-record outcome listed below |
@@ -19,6 +19,10 @@ a BagIt manifest, or evidence that an export is an archival information package.
 | `sourceSha256` | SHA-256 of the source bytes read during the copy |
 | `exportedSha256` | SHA-256 independently read from the published export |
 | `verification` | `verified`, `failed`, or `not-performed` |
+| `sidecarFixityAlgorithm` | `sha256` when a sidecar was copied; otherwise null |
+| `sidecarSourceSha256` | SHA-256 of the sidecar source bytes read during copy |
+| `sidecarExportedSha256` | SHA-256 independently read from the published sidecar |
+| `sidecarVerification` | `verified`, `failed`, or `not-performed` |
 
 The source checksum represents the byte stream actually read. It does not prove
 the source was authentic before recovery, nor does it replace a checksum created
@@ -53,11 +57,14 @@ Re-read every exported file that has a recorded checksum:
 python3 de-immich.py --verify-manifest /path/to/export/manifest.jsonl
 ```
 
-The command returns exit status `2` if a file is missing, its current SHA-256
+The command verifies both originals and copied sidecars. It returns exit status
+`2` if a file is missing, its current SHA-256
 differs, or the report already records a failed source/output comparison. It
 returns `1` for an invalid, unreadable, or unsupported report. Rows without an
 exported path and checksum are not verification candidates unless their status
 claims an export; exported rows with incomplete fixity evidence are invalid.
+Schema 1.0 reports remain accepted; sidecars created by that schema did not have
+independent fixity fields and therefore cannot be retrospectively verified.
 
 ## Privacy and portability
 

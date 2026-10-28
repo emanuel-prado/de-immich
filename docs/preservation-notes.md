@@ -13,7 +13,7 @@ implementation, or substitute for multiple tested backups.
 | Provenance | Original/resolved/export paths, owner/library references, timestamp, tool version | Not a complete chain of custody |
 | Relationships | Sidecar, live-photo, duplicate, and stack reference IDs when present | References are retained, not fully reconstructed |
 | Recovery outcomes | Exported, missing, skipped, or fixity-failed per asset | Not a complete preservation-event history |
-| Fixity | Source/output SHA-256 and later manifest verification | Copy equivalence, not prior authenticity; sidecars excluded |
+| Fixity | Source/output SHA-256 and later manifest verification for originals and copied sidecars | Copy equivalence, not prior authenticity |
 | Portability | CSV and JSONL | Reports contain environment-specific absolute paths |
 
 The source checksum describes the bytes actually read during recovery. Matching
@@ -87,11 +87,13 @@ same filesystem state. An interrupted run retains `manifest.jsonl.partial`.
 - External libraries need explicit recorded-root to local-root mappings. Guessing
   arbitrary absolute paths is unsafe.
 - Named Immich release support requires fixtures captured from those releases.
-- Current Immich sidecars use `asset_file`; historical `asset.sidecarPath`
-  behavior must not be presented as current compatibility.
+- Current Immich XMP sidecars in `asset_file` and historical
+  `asset.sidecarPath` references are supported; other derivative relationships
+  remain report-only or unsupported.
 - Reports are sensitive because paths, identifiers, dates, and EXIF may identify
   people or places. Relative/redacted reporting needs an explicit schema change.
-- Sidecars and metadata sidecars need their own relationship and fixity fields.
+- Generated JSON metadata sidecars are not independently inventoried or covered
+  by fixity fields.
 - The CLI assumes exclusive control of the output during a run. Its path checks
   do not constitute a sandbox against a concurrent process racing filesystem
   components between validation and use.

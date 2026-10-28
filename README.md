@@ -33,11 +33,11 @@ and produces inspectable CSV and JSONL recovery reports.
 | Later verification | Re-reads exports and rejects corruption, absence, symlink substitution, unsupported reports, and previously recorded copy failures |
 | Auditability | Records exported, missing, and skipped outcomes; retains a partial JSONL journal after interruption |
 | Metadata | Retains asset fields and available `asset_exif` fields without inventing values |
-| Related files | Supports historical dumps that contain `asset.sidecarPath`; can write per-asset JSON sidecars |
+| Related files | Copies historical `asset.sidecarPath` and current `asset_file` XMP sidecars; can also write per-asset JSON sidecars |
 
-Not implemented: safe resume, explicit external-library path mappings, current
-`asset_file` sidecar recovery, schema/version auto-detection, BagIt packages, or a
-PREMIS representation. These are not implied by the preservation terminology.
+Not implemented: safe resume, explicit external-library path mappings,
+schema/version auto-detection, BagIt packages, or a PREMIS representation. These
+are not implied by the preservation terminology.
 
 ## Quick start
 
@@ -141,9 +141,9 @@ location-related EXIF. Treat them as sensitive and redact before sharing.
   deleted/offline states, fixity, and repeat-run refusal. This is evidence for
   that release and dump shape only, not a promise of compatibility with other
   Immich versions.
-- Current Immich v3.3.5 stores related sidecars/derivatives in `asset_file`; the
-  script's optional `asset.sidecarPath` behavior applies only to historical dump
-  shapes and is not current-version sidecar support.
+- Current Immich v3.3.5 XMP sidecars stored in `asset_file` and historical
+  `asset.sidecarPath` references are supported with `--copy-sidecars`. Other
+  `asset_file` derivatives are deliberately not exported as originals.
 - Absolute paths are mapped only when they contain a recognized Immich internal
   storage directory. External libraries need an explicit mapping design and are
   currently rejected rather than guessed.
@@ -153,7 +153,8 @@ location-related EXIF. Treat them as sensitive and redact before sharing.
   path components during the operation.
 - EXIF rows and report rows are retained in memory, and the compressed dump is
   read multiple times. No scale/performance claim has been published.
-- Sidecars are not currently included in fixity fields.
+- Copied sidecars have their own source/output SHA-256 and later verification
+  fields. Generated JSON metadata sidecars are not independently inventoried.
 
 See the roadmap for measured acceptance criteria rather than promises of
 production readiness.

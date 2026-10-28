@@ -143,7 +143,7 @@ class ExportTests(unittest.TestCase):
         manifest = self.root / "manifest.jsonl"
         manifest.write_text(
             json.dumps(
-                {"reportSchemaVersion": "1.0", "status": "exported"}
+                {"reportSchemaVersion": self.app.REPORT_SCHEMA_VERSION, "status": "exported"}
             )
             + "\n",
             encoding="utf-8",
@@ -151,6 +151,55 @@ class ExportTests(unittest.TestCase):
 
         with self.assertRaisesRegex(
             self.app.BackupFormatError, "incomplete fixity record"
+        ):
+            self.app.verify_manifest(manifest)
+
+    def test_manifest_verification_accepts_schema_1_0_without_sidecar_fixity(self):
+        exported = self.root / "asset.jpg"
+        exported.write_bytes(b"asset")
+        digest = self.app.sha256_file(exported)
+        manifest = self.root / "manifest.jsonl"
+        manifest.write_text(
+            json.dumps(
+                {
+                    "reportSchemaVersion": "1.0",
+                    "status": "exported",
+                    "exportedPath": str(exported),
+                    "sourceSha256": digest,
+                    "exportedSha256": digest,
+                    "verification": "verified",
+                    "exportedSidecarPath": str(self.root / "legacy.xmp"),
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        self.assertEqual(self.app.verify_manifest(manifest), 0)
+
+    def test_manifest_verification_requires_schema_1_1_sidecar_fixity(self):
+        exported = self.root / "asset.jpg"
+        exported.write_bytes(b"asset")
+        digest = self.app.sha256_file(exported)
+        manifest = self.root / "manifest.jsonl"
+        manifest.write_text(
+            json.dumps(
+                {
+                    "reportSchemaVersion": self.app.REPORT_SCHEMA_VERSION,
+                    "status": "exported",
+                    "exportedPath": str(exported),
+                    "sourceSha256": digest,
+                    "exportedSha256": digest,
+                    "verification": "verified",
+                    "exportedSidecarPath": str(self.root / "sidecar.xmp"),
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(
+            self.app.BackupFormatError, "incomplete sidecar fixity"
         ):
             self.app.verify_manifest(manifest)
 
@@ -272,6 +321,67 @@ class ExportTests(unittest.TestCase):
                     self.root / "export",
                     copy_sidecars=True,
                 )
+            )
+
+    def test_current_asset_file_sidecar_is_copied_beside_original(self):
+        (self.library / "upload/one.jpg").write_bytes(b"image")
+        (self.library / "upload/random.xmp").write_bytes(b"metadata")
+        backup = write_backup(
+            self.root / "backup.sql.gz",
+            [
+                {
+                    "id": "asset-1",
+                    "originalPath": "upload/one.jpg",
+                    "originalFileName": "meaningful.jpg",
+                }
+            ],
+            asset_files=[
+                {"assetId": "asset-1", "type": "sidecar", "path": "upload/random.xmp"},
+                {"assetId": "asset-1", "type": "thumbnail", "path": "thumbs/ignored.webp"},
+            ],
+        )
+        output = self.root / "export"
+
+        self.assertEqual(
+            self.app.export_assets(
+                arguments(self.library, backup, output, copy_sidecars=True)
+            ),
+            0,
+        )
+        self.assertEqual((output / "meaningful.jpg").read_bytes(), b"image")
+        self.assertEqual(
+            (output / "meaningful.jpg.xmp").read_bytes(), b"metadata"
+        )
+        row = json.loads((output / "manifest.jsonl").read_text().splitlines()[0])
+        self.assertEqual(row["sidecarPath"], "upload/random.xmp")
+        self.assertEqual(row["exportedSidecarPath"], str(output / "meaningful.jpg.xmp"))
+        self.assertEqual(row["sidecarVerification"], "verified")
+        self.assertEqual(row["sidecarSourceSha256"], row["sidecarExportedSha256"])
+        self.assertEqual(self.app.verify_manifest(output / "manifest.jsonl"), 0)
+        (output / "meaningful.jpg.xmp").write_bytes(b"corrupt")
+        self.assertEqual(self.app.verify_manifest(output / "manifest.jsonl"), 2)
+
+    def test_multiple_current_sidecars_are_rejected(self):
+        backup = write_backup(
+            self.root / "backup.sql.gz",
+            [
+                {
+                    "id": "asset-1",
+                    "originalPath": "upload/one.jpg",
+                    "originalFileName": "one.jpg",
+                }
+            ],
+            asset_files=[
+                {"assetId": "asset-1", "type": "sidecar", "path": "upload/one.xmp"},
+                {"assetId": "asset-1", "type": "sidecar", "path": "upload/two.xmp"},
+            ],
+        )
+
+        with self.assertRaisesRegex(
+            self.app.BackupFormatError, "multiple sidecars"
+        ):
+            self.app.export_assets(
+                arguments(self.library, backup, self.root / "export")
             )
 
 

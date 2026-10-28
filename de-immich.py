@@ -20,13 +20,16 @@ from typing import Dict, Iterator, List, Optional, Set, Tuple
 COPY_PREFIXES = {
     "asset": "COPY public.asset ",
     "asset_exif": "COPY public.asset_exif ",
+    "asset_file": "COPY public.asset_file ",
 }
-TOOL_VERSION = "0.2.0"
-REPORT_SCHEMA_VERSION = "1.0"
+TOOL_VERSION = "0.3.0"
+REPORT_SCHEMA_VERSION = "1.1"
+SUPPORTED_REPORT_SCHEMA_VERSIONS = {"1.0", REPORT_SCHEMA_VERSION}
 
 REQUIRED_COLUMNS = {
     "asset": {"id", "originalPath", "originalFileName"},
     "asset_exif": {"assetId"},
+    "asset_file": {"assetId", "type", "path"},
 }
 
 
@@ -279,7 +282,7 @@ def parse_copy_row(line: str, columns: List[str]) -> Dict[str, Optional[str]]:
 
 
 def iter_copy_rows(
-    sql_gz_path: Path, table_name: str
+    sql_gz_path: Path, table_name: str, required: bool = True
 ) -> Iterator[Dict[str, Optional[str]]]:
     prefix = COPY_PREFIXES[table_name]
     with gzip.open(sql_gz_path, "rt", encoding="utf-8") as handle:
@@ -306,7 +309,8 @@ def iter_copy_rows(
             raise BackupFormatError(
                 f"COPY public.{table_name} has no terminating \\. marker"
             )
-        raise BackupFormatError(f"Backup has no COPY public.{table_name} section")
+        if required:
+            raise BackupFormatError(f"Backup has no COPY public.{table_name} section")
 
 
 def count_copy_rows(sql_gz_path: Path, table_name: str) -> int:
@@ -510,6 +514,25 @@ def load_exif_map(sql_gz_path: Path) -> Dict[str, Dict[str, Optional[str]]]:
     return exif_map
 
 
+def load_asset_file_sidecars(sql_gz_path: Path) -> Dict[str, str]:
+    sidecars: Dict[str, str] = {}
+    for row in iter_copy_rows(sql_gz_path, "asset_file", required=False):
+        if row.get("type") != "sidecar":
+            continue
+        asset_id = row.get("assetId")
+        path = row.get("path")
+        if not asset_id or not path:
+            raise BackupFormatError(
+                "COPY public.asset_file has a sidecar row without assetId or path"
+            )
+        if asset_id in sidecars:
+            raise BackupFormatError(
+                f"COPY public.asset_file has multiple sidecars for asset {asset_id}"
+            )
+        sidecars[asset_id] = path
+    return sidecars
+
+
 def manifest_row(
     asset: Dict[str, Optional[str]],
     exif: Dict[str, Optional[str]],
@@ -522,6 +545,9 @@ def manifest_row(
     source_sha256: Optional[str] = None,
     exported_sha256: Optional[str] = None,
     verification: str = "not-performed",
+    sidecar_source_sha256: Optional[str] = None,
+    sidecar_exported_sha256: Optional[str] = None,
+    sidecar_verification: str = "not-performed",
 ) -> Dict[str, object]:
     data: Dict[str, object] = {
         "status": status,
@@ -532,6 +558,10 @@ def manifest_row(
         "sourceSha256": source_sha256,
         "exportedSha256": exported_sha256,
         "verification": verification,
+        "sidecarFixityAlgorithm": "sha256" if sidecar_source_sha256 else None,
+        "sidecarSourceSha256": sidecar_source_sha256,
+        "sidecarExportedSha256": sidecar_exported_sha256,
+        "sidecarVerification": sidecar_verification,
         "assetId": asset.get("id"),
         "type": asset.get("type"),
         "originalFileName": asset.get("originalFileName"),
@@ -593,7 +623,7 @@ def verify_manifest(manifest_path: Path) -> int:
                 raise BackupFormatError(
                     f"Manifest line {line_number} is not a JSON object"
                 )
-            if row.get("reportSchemaVersion") != REPORT_SCHEMA_VERSION:
+            if row.get("reportSchemaVersion") not in SUPPORTED_REPORT_SCHEMA_VERSIONS:
                 raise BackupFormatError(
                     f"Manifest line {line_number} has unsupported report schema: "
                     f"{row.get('reportSchemaVersion')!r}"
@@ -610,53 +640,63 @@ def verify_manifest(manifest_path: Path) -> int:
                 raise BackupFormatError(
                     f"Manifest line {line_number} has an incomplete export reference"
                 )
-            if not expected or not exported:
-                continue
-            if not isinstance(exported, str) or not isinstance(expected, str):
-                raise BackupFormatError(
-                    f"Manifest line {line_number} has non-string fixity fields"
-                )
-            if len(expected) != 64 or any(
-                character not in "0123456789abcdef" for character in expected
+            fixity_records = [
+                (
+                    exported,
+                    expected,
+                    row.get("sourceSha256"),
+                    row.get("verification"),
+                ),
+                (
+                    row.get("exportedSidecarPath"),
+                    row.get("sidecarExportedSha256"),
+                    row.get("sidecarSourceSha256"),
+                    row.get("sidecarVerification"),
+                ),
+            ]
+            sidecar_values = fixity_records[1]
+            sidecar_fixity_required = (
+                row.get("reportSchemaVersion") == REPORT_SCHEMA_VERSION
+                and sidecar_values[0] is not None
+            ) or any(value is not None for value in sidecar_values[1:3])
+            if sidecar_fixity_required and not all(
+                value is not None for value in sidecar_values[:3]
             ):
                 raise BackupFormatError(
-                    f"Manifest line {line_number} has an invalid SHA-256 value"
+                    f"Manifest line {line_number} has an incomplete sidecar fixity record"
                 )
-            checked += 1
-            path = Path(exported)
-            reasons: List[str] = []
-            source_sha256 = row.get("sourceSha256")
-            if source_sha256 is not None and (
-                not isinstance(source_sha256, str)
-                or len(source_sha256) != 64
-                or any(
-                    character not in "0123456789abcdef"
-                    for character in source_sha256
-                )
-            ):
-                raise BackupFormatError(
-                    f"Manifest line {line_number} has an invalid source SHA-256 value"
-                )
-            if (
-                row.get("verification") == "failed"
-                or row.get("status") == "verification-failed"
-            ):
-                reasons.append("recorded copy verification failed")
-            if source_sha256 and source_sha256 != expected:
-                reasons.append("recorded source/output checksums differ")
-            if path.is_symlink():
-                reasons.append("export was replaced by a symbolic link")
-            elif not path.is_file():
-                reasons.append("export is missing")
-            else:
-                actual = sha256_file(path)
-                if actual != expected:
+            for path_value, expected_value, source_value, outcome in fixity_records:
+                if not expected_value or not path_value:
+                    continue
+                if not isinstance(path_value, str) or not isinstance(expected_value, str):
+                    raise BackupFormatError(
+                        f"Manifest line {line_number} has non-string fixity fields"
+                    )
+                for digest in (expected_value, source_value):
+                    if not isinstance(digest, str) or len(digest) != 64 or any(
+                        character not in "0123456789abcdef" for character in digest
+                    ):
+                        raise BackupFormatError(
+                            f"Manifest line {line_number} has an invalid SHA-256 value"
+                        )
+                checked += 1
+                path = Path(path_value)
+                reasons: List[str] = []
+                if outcome == "failed":
+                    reasons.append("recorded copy verification failed")
+                if source_value != expected_value:
+                    reasons.append("recorded source/output checksums differ")
+                if path.is_symlink():
+                    reasons.append("export was replaced by a symbolic link")
+                elif not path.is_file():
+                    reasons.append("export is missing")
+                elif sha256_file(path) != expected_value:
                     reasons.append("current checksum differs")
-            if reasons:
-                failures += 1
-                print(f"FAIL: {path}: {'; '.join(reasons)}")
-            else:
-                print(f"OK: {path}")
+                if reasons:
+                    failures += 1
+                    print(f"FAIL: {path}: {'; '.join(reasons)}")
+                else:
+                    print(f"OK: {path}")
     print(f"Files checked: {checked}")
     print(f"Verification failures: {failures}")
     return 2 if failures else 0
@@ -675,6 +715,7 @@ def export_assets(args: argparse.Namespace) -> int:
         raise FileNotFoundError(f"Backup not found: {backup_path}")
 
     exif_map = load_exif_map(backup_path)
+    asset_file_sidecars = load_asset_file_sidecars(backup_path)
     total_assets = count_copy_rows(backup_path, "asset")
     stats = ExportStats()
     progress = ProgressReporter(total_assets, enabled=not args.no_progress)
@@ -713,6 +754,16 @@ def export_assets(args: argparse.Namespace) -> int:
         asset_id = asset.get("id")
         if not asset_id:
             raise BackupFormatError(f"Asset row {processed} has no id")
+
+        asset_file_sidecar = asset_file_sidecars.get(asset_id)
+        if asset_file_sidecar:
+            legacy_sidecar = asset.get("sidecarPath")
+            if legacy_sidecar and legacy_sidecar != asset_file_sidecar:
+                raise BackupFormatError(
+                    f"Asset {asset_id} has conflicting sidecar paths"
+                )
+            asset["sidecarPath"] = asset_file_sidecar
+            asset["_sidecarSourceTable"] = "asset_file"
 
         if asset.get("deletedAt") and not args.include_deleted:
             stats.skipped_deleted += 1
@@ -815,20 +866,36 @@ def export_assets(args: argparse.Namespace) -> int:
                 stats.verification_failed += 1
 
         sidecar_dest = None
+        sidecar_source_sha256 = None
+        sidecar_exported_sha256 = None
+        sidecar_verification = "not-performed"
         if args.copy_sidecars and sidecar_source and sidecar_source.exists():
             if not sidecar_source.is_file():
                 raise UnsafePathError(
                     f"Sidecar source is not a regular file: {sidecar_source}"
                 )
-            sidecar_name = sanitize_filename(sidecar_source.name)
+            if asset.get("_sidecarSourceTable") == "asset_file":
+                sidecar_name = sanitize_filename(
+                    final_dest.name + sidecar_source.suffix
+                )
+            else:
+                sidecar_name = sanitize_filename(sidecar_source.name)
             sidecar_dest = ensure_unique_destination(
                 final_dest.parent / sidecar_name, asset_id, reserved_destinations
             )
             validate_destination(output_dir, sidecar_dest)
-            copy_with_metadata(
+            sidecar_source_sha256, sidecar_exported_sha256 = copy_with_metadata(
                 sidecar_source, sidecar_dest, media_timestamp, args.dry_run
             )
             stats.sidecars_exported += 1
+            if sidecar_source_sha256 is not None:
+                if sidecar_source_sha256 == sidecar_exported_sha256:
+                    sidecar_verification = "verified"
+                    stats.verified += 1
+                else:
+                    sidecar_verification = "failed"
+                    status = "verification-failed"
+                    stats.verification_failed += 1
 
         row = manifest_row(
             asset,
@@ -842,6 +909,9 @@ def export_assets(args: argparse.Namespace) -> int:
             source_sha256,
             exported_sha256,
             verification,
+            sidecar_source_sha256,
+            sidecar_exported_sha256,
+            sidecar_verification,
         )
         record(row)
 

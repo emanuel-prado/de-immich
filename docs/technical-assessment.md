@@ -99,19 +99,18 @@ refusal. The source storage snapshot was unchanged after recovery.
 
 This is deliberately narrow evidence. The instance ran from pinned source
 because OCI registries were unavailable in the test environment, not from the
-published production image. Immich's microservices worker also requires a
-geodata bundle normally supplied by that image, so background metadata
-extraction was not part of the run. The database schema and storage paths were
-nevertheless produced by v3.3.5 itself; the result does not establish support
-for earlier or later releases, external libraries, or current `asset_file`
-sidecar recovery.
+published production image. A minimal synthetic geodata payload matching the
+base image's file interfaces allowed the microservices worker to run. Immich
+itself extracted embedded and XMP metadata, generated derivatives, and created
+the `asset_file(type='sidecar')` relationship used to validate sidecar recovery
+and fixity. The result does not establish support for earlier or later releases,
+external libraries, or non-sidecar derivatives.
 
 ## Residual risks
 
 Highest priority is verified resume: current behavior safely refuses an output
 with a complete or partial report, but assets copied before an interruption can
-remain. External libraries are rejected rather than recoverable. Sidecars are not
-covered by fixity. Reports expose absolute paths and potentially identifying
+remain. External libraries are rejected rather than recoverable. Reports expose absolute paths and potentially identifying
 metadata. EXIF/report rows consume memory and the gzip dump is read multiple
 times; optimization should follow measured scale tests, not speculation.
 

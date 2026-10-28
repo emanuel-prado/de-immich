@@ -17,6 +17,7 @@ ASSET_COLUMNS = (
     "sidecarPath",
 )
 EXIF_COLUMNS = ("assetId", "dateTimeOriginal", "description")
+ASSET_FILE_COLUMNS = ("assetId", "type", "path")
 
 
 def _copy_value(value: Optional[str]) -> str:
@@ -44,14 +45,15 @@ def write_backup(
     path: Path,
     assets: Iterable[Mapping[str, Optional[str]]],
     exif: Iterable[Mapping[str, Optional[str]]] = (),
+    asset_files: Optional[Iterable[Mapping[str, Optional[str]]]] = None,
 ) -> Path:
-    text = "\n".join(
-        (
-            _section("asset", ASSET_COLUMNS, assets),
-            _section("asset_exif", EXIF_COLUMNS, exif),
-            "",
-        )
-    )
+    sections = [
+        _section("asset", ASSET_COLUMNS, assets),
+        _section("asset_exif", EXIF_COLUMNS, exif),
+    ]
+    if asset_files is not None:
+        sections.append(_section("asset_file", ASSET_FILE_COLUMNS, asset_files))
+    text = "\n".join((*sections, ""))
     with gzip.open(path, "wt", encoding="utf-8") as handle:
         handle.write(text)
     return path
