@@ -1,6 +1,6 @@
 # Independent technical assessment
 
-Assessment date: 2026-10-27. Scope: repository history through PRs #1–#4,
+Assessment date: 2026-10-28. Scope: repository history through PRs #1–#5,
 application source, documentation, synthetic reproductions, and upstream
 specifications/source noted below.
 
@@ -18,6 +18,17 @@ issues before merge:
 - verification followed a substituted output symlink and accepted identical
   target bytes;
 - the report schema documented a dry-run `planned` row that is never persisted.
+- dry-run accepted outputs whose existing manifests made the real run refuse;
+- flat assets could claim `manifest.csv`, and generated JSON sidecar names could
+  fail depending on database row order;
+- dangling destination symlinks were absent according to `Path.exists()`, so
+  planning and publication disagreed;
+- an output below the source library mutated the recovery source tree;
+- overlong source names failed during publication instead of receiving a stable,
+  bounded name;
+- CRLF-formatted COPY records retained carriage returns and missed terminators;
+- manifest verification accepted unsupported algorithm labels, invented outcome
+  values, and unknown statuses.
 
 Regression tests now cover each corrected behavior. Filesystem checks assume the
 tool has exclusive control of its output; defending against a malicious process

@@ -1,5 +1,6 @@
 import argparse
 import csv
+import gzip
 import json
 import tempfile
 import unittest
@@ -104,6 +105,65 @@ class ExportTests(unittest.TestCase):
         self.assertEqual(manifest.read_text(encoding="utf-8"), "keep me")
         self.assertFalse((output / "same.jpg").exists())
 
+    def test_dry_run_rejects_existing_manifest_like_real_export(self):
+        backup = self._collision_backup()
+        output = self.root / "export"
+        output.mkdir()
+        (output / "manifest.jsonl").write_text("keep me", encoding="utf-8")
+
+        with self.assertRaisesRegex(FileExistsError, "existing manifest"):
+            self.app.export_assets(
+                arguments(self.library, backup, output, dry_run=True)
+            )
+
+    def test_flat_asset_cannot_claim_manifest_filename(self):
+        (self.library / "upload/one.bin").write_bytes(b"one")
+        backup = write_backup(
+            self.root / "backup.sql.gz",
+            [
+                {
+                    "id": "asset-1",
+                    "originalPath": "upload/one.bin",
+                    "originalFileName": "manifest.csv",
+                }
+            ],
+        )
+        output = self.root / "export"
+
+        self.app.export_assets(arguments(self.library, backup, output))
+
+        token = self.app.hashlib.sha256(b"asset-1").hexdigest()[:12]
+        self.assertEqual((output / f"manifest__{token}.csv").read_bytes(), b"one")
+        with (output / "manifest.csv").open(newline="", encoding="utf-8") as handle:
+            self.assertEqual(len(list(csv.DictReader(handle))), 1)
+
+    def test_metadata_sidecar_collision_is_resolved(self):
+        (self.library / "upload/one.bin").write_bytes(b"one")
+        (self.library / "upload/two.bin").write_bytes(b"two")
+        backup = write_backup(
+            self.root / "backup.sql.gz",
+            [
+                {
+                    "id": "asset-1",
+                    "originalPath": "upload/one.bin",
+                    "originalFileName": "photo.jpg.immich.json",
+                },
+                {
+                    "id": "asset-2",
+                    "originalPath": "upload/two.bin",
+                    "originalFileName": "photo.jpg",
+                },
+            ],
+        )
+        output = self.root / "export"
+
+        self.app.export_assets(
+            arguments(self.library, backup, output, write_json_sidecars=True)
+        )
+
+        token = self.app.hashlib.sha256(b"asset-2:metadata").hexdigest()[:12]
+        self.assertTrue((output / f"photo__{token}.jpg.immich.json").is_file())
+
     def test_manifest_verification_detects_corruption(self):
         backup = self._collision_backup()
         output = self.root / "export"
@@ -154,6 +214,32 @@ class ExportTests(unittest.TestCase):
         ):
             self.app.verify_manifest(manifest)
 
+    def test_manifest_verification_rejects_invalid_fixity_contract(self):
+        exported = self.root / "asset.jpg"
+        exported.write_bytes(b"asset")
+        digest = self.app.sha256_file(exported)
+        base = {
+            "reportSchemaVersion": self.app.REPORT_SCHEMA_VERSION,
+            "status": "exported",
+            "fixityAlgorithm": "sha256",
+            "sourceSha256": digest,
+            "exportedSha256": digest,
+            "verification": "verified",
+            "exportedPath": str(exported),
+        }
+
+        for field, value, message in (
+            ("fixityAlgorithm", "md5", "invalid fixity algorithm"),
+            ("verification", "banana", "invalid verification outcome"),
+            ("status", "unknown", "invalid status"),
+        ):
+            with self.subTest(field=field):
+                manifest = self.root / f"{field}.jsonl"
+                row = {**base, field: value}
+                manifest.write_text(json.dumps(row) + "\n", encoding="utf-8")
+                with self.assertRaisesRegex(self.app.BackupFormatError, message):
+                    self.app.verify_manifest(manifest)
+
     def test_manifest_verification_accepts_schema_1_0_without_sidecar_fixity(self):
         exported = self.root / "asset.jpg"
         exported.write_bytes(b"asset")
@@ -164,6 +250,7 @@ class ExportTests(unittest.TestCase):
                 {
                     "reportSchemaVersion": "1.0",
                     "status": "exported",
+                    "fixityAlgorithm": "sha256",
                     "exportedPath": str(exported),
                     "sourceSha256": digest,
                     "exportedSha256": digest,
@@ -176,6 +263,32 @@ class ExportTests(unittest.TestCase):
         )
 
         self.assertEqual(self.app.verify_manifest(manifest), 0)
+
+    def test_manifest_verification_rejects_unsubstantiated_failure_status(self):
+        exported = self.root / "asset.jpg"
+        exported.write_bytes(b"asset")
+        digest = self.app.sha256_file(exported)
+        manifest = self.root / "manifest.jsonl"
+        manifest.write_text(
+            json.dumps(
+                {
+                    "reportSchemaVersion": self.app.REPORT_SCHEMA_VERSION,
+                    "status": "verification-failed",
+                    "fixityAlgorithm": "sha256",
+                    "sourceSha256": digest,
+                    "exportedSha256": digest,
+                    "verification": "verified",
+                    "exportedPath": str(exported),
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(
+            self.app.BackupFormatError, "without a failed outcome"
+        ):
+            self.app.verify_manifest(manifest)
 
     def test_manifest_verification_requires_schema_1_1_sidecar_fixity(self):
         exported = self.root / "asset.jpg"
@@ -381,7 +494,49 @@ class ExportTests(unittest.TestCase):
             self.app.BackupFormatError, "multiple sidecars"
         ):
             self.app.export_assets(
-                arguments(self.library, backup, self.root / "export")
+                arguments(
+                    self.library,
+                    backup,
+                    self.root / "export",
+                    copy_sidecars=True,
+                )
+            )
+
+    def test_unused_asset_file_schema_does_not_block_original_recovery(self):
+        (self.library / "upload/one.jpg").write_bytes(b"image")
+        backup = write_backup(
+            self.root / "backup.sql.gz",
+            [
+                {
+                    "id": "asset-1",
+                    "originalPath": "upload/one.jpg",
+                    "originalFileName": "one.jpg",
+                }
+            ],
+        )
+        with gzip.open(backup, "at", encoding="utf-8") as handle:
+            handle.write(
+                'COPY public.asset_file ("assetId", "type") FROM stdin;\n'
+                'asset-1\tsidecar\n'
+                '\\.\n'
+            )
+
+        self.assertEqual(
+            self.app.export_assets(
+                arguments(self.library, backup, self.root / "original-only")
+            ),
+            0,
+        )
+        with self.assertRaisesRegex(
+            self.app.BackupFormatError, "missing required columns: path"
+        ):
+            self.app.export_assets(
+                arguments(
+                    self.library,
+                    backup,
+                    self.root / "with-sidecars",
+                    copy_sidecars=True,
+                )
             )
 
 
