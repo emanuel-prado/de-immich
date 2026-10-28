@@ -88,9 +88,23 @@ and fixity work rather than merged as an aspirational standalone narrative.
 - [RFC 8493](https://www.rfc-editor.org/rfc/rfc8493.html) requires substantially
   more than a checksum list for BagIt. Bagging is deferred, not advertised.
 
-No named Immich version is claimed compatible. Reading upstream schema is useful
-design evidence but is not an end-to-end test of an actual version's generated
-dump and storage layout.
+Immich v3.3.5 is the first named, end-to-end-tested release. A native instance at
+upstream commit `8303cb117e197c700332b33b61b45314c9cc5bb4` migrated a PostgreSQL
+18 database and accepted synthetic image and video uploads through its API. A
+plain `pg_dump`, compressed with gzip, was then recovered with this tool. The
+exercise covered duplicate and Unicode original names, dated and flat exports,
+limits, deleted/offline/missing outcomes, JSON metadata sidecars, source/output
+SHA-256 agreement, later corruption and absence detection, and repeat-run
+refusal. The source storage snapshot was unchanged after recovery.
+
+This is deliberately narrow evidence. The instance ran from pinned source
+because OCI registries were unavailable in the test environment, not from the
+published production image. Immich's microservices worker also requires a
+geodata bundle normally supplied by that image, so background metadata
+extraction was not part of the run. The database schema and storage paths were
+nevertheless produced by v3.3.5 itself; the result does not establish support
+for earlier or later releases, external libraries, or current `asset_file`
+sidecar recovery.
 
 ## Residual risks
 

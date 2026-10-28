@@ -135,8 +135,12 @@ location-related EXIF. Treat them as sensitive and redact before sharing.
 
 - Input must contain terminated `COPY public.asset` and
   `COPY public.asset_exif` sections with the documented required columns.
-- No specific Immich release is claimed as supported. The fixture describes a
-  tested dump shape, not a release compatibility matrix.
+- Immich v3.3.5 has been exercised end to end with a database migrated by that
+  release and originals uploaded through its API. The test covered PostgreSQL
+  18 `pg_dump` output, images, video, Unicode names, collisions, missing files,
+  deleted/offline states, fixity, and repeat-run refusal. This is evidence for
+  that release and dump shape only, not a promise of compatibility with other
+  Immich versions.
 - Current Immich v3.3.5 stores related sidecars/derivatives in `asset_file`; the
   script's optional `asset.sidecarPath` behavior applies only to historical dump
   shapes and is not current-version sidecar support.

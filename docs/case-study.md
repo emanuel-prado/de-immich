@@ -36,7 +36,9 @@ The implementation is deliberately a single-file CLI rather than another applica
 ## Tradeoffs and limitations
 
 - Requires both the backup and original media; it cannot reconstruct deleted or absent file contents.
-- Database parser currently expects specific Immich COPY sections; a compatibility matrix remains to be built.
+- Database parser currently expects specific Immich COPY sections. Immich
+  v3.3.5 has one end-to-end synthetic validation; a multi-version compatibility
+  matrix remains to be built.
 - Current manifests are a practical export inventory, **not** standards-conformant preservation records.
 - Safe resume, external-library mapping, current-schema sidecar recovery, and a
   complete preservation-event model remain to be implemented.
