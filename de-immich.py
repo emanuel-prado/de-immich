@@ -669,6 +669,14 @@ def verify_manifest(manifest_path: Path) -> int:
                 raise BackupFormatError(
                     f"Manifest line {line_number} has an invalid verification outcome"
                 )
+            if (
+                status == "verification-failed"
+                and row.get("verification") != "failed"
+            ):
+                raise BackupFormatError(
+                    f"Manifest line {line_number} reports a verification failure "
+                    "without a failed outcome"
+                )
             if not isinstance(exported, str) or not isinstance(expected, str):
                 raise BackupFormatError(
                     f"Manifest line {line_number} has non-string fixity fields"
