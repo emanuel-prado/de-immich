@@ -77,6 +77,37 @@ class PathAndCollisionTests(unittest.TestCase):
         with self.assertRaisesRegex(self.app.UnsafePathError, "symbolic link"):
             self.app.validate_destination(output, output / "2026/01/photo.jpg")
 
+    def test_dangling_destination_symlink_is_treated_as_collision(self):
+        desired = self.root / "photo.jpg"
+        desired.symlink_to(self.root / "missing.jpg")
+
+        actual = self.app.ensure_unique_destination(desired, "asset-1", set())
+
+        token = self.app.hashlib.sha256(b"asset-1").hexdigest()[:12]
+        self.assertEqual(actual, self.root / f"photo__{token}.jpg")
+
+    def test_output_must_not_overlap_source_library(self):
+        library = self.root / "library"
+        library.mkdir()
+
+        for output in (library, library / "export", self.root):
+            with self.subTest(output=output):
+                with self.assertRaisesRegex(
+                    self.app.UnsafePathError, "overlaps the source library"
+                ):
+                    self.app.ensure_separate_trees(library, output)
+
+    def test_long_filename_is_bounded_and_keeps_extension(self):
+        original = "é" * 200 + ".jpg"
+
+        sanitized = self.app.sanitize_filename(original)
+
+        self.assertLessEqual(
+            len(sanitized.encode("utf-8")), self.app.MAX_EXPORT_FILENAME_BYTES
+        )
+        self.assertTrue(sanitized.endswith(".jpg"))
+        self.assertEqual(sanitized, self.app.sanitize_filename(original))
+
     def test_limit_must_be_positive(self):
         self.assertEqual(self.app.positive_int("2"), 2)
         with self.assertRaises(self.app.argparse.ArgumentTypeError):

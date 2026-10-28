@@ -21,6 +21,7 @@ COPY_PREFIXES = {
     "asset": "COPY public.asset ",
     "asset_exif": "COPY public.asset_exif ",
 }
+MAX_EXPORT_FILENAME_BYTES = 220
 
 REQUIRED_COLUMNS = {
     "asset": {"id", "originalPath", "originalFileName"},
@@ -255,7 +256,7 @@ def postgres_copy_unescape(value: str) -> str:
 
 
 def parse_copy_row(line: str, columns: List[str]) -> Dict[str, Optional[str]]:
-    parts = line.rstrip("\n").split("\t")
+    parts = line.rstrip("\r\n").split("\t")
     if len(parts) != len(columns):
         raise BackupFormatError(
             f"COPY row has {len(parts)} fields; expected {len(columns)}"
@@ -288,7 +289,7 @@ def iter_copy_rows(
                         )
                     in_copy = True
                 continue
-            if line.rstrip("\n") == r"\.":
+            if line.rstrip("\r\n") == r"\.":
                 return
             if columns is None:
                 raise RuntimeError(f"Failed to parse columns for {table_name}")
@@ -333,7 +334,21 @@ def sanitize_filename(name: str) -> str:
         for char in name
     )
     clean = clean.strip()
-    return clean if clean not in {"", ".", ".."} else "unnamed"
+    if clean in {"", ".", ".."}:
+        return "unnamed"
+    if len(clean.encode("utf-8")) <= MAX_EXPORT_FILENAME_BYTES:
+        return clean
+
+    suffix = Path(clean).suffix
+    if len(suffix.encode("utf-8")) > 32:
+        suffix = ""
+    stem = clean[: -len(suffix)] if suffix else clean
+    token = hashlib.sha256(clean.encode("utf-8")).hexdigest()[:12]
+    ending = f"__{token}{suffix}"
+    available = MAX_EXPORT_FILENAME_BYTES - len(ending.encode("utf-8"))
+    while len(stem.encode("utf-8")) > available:
+        stem = stem[:-1]
+    return f"{stem}{ending}"
 
 
 def split_name(filename: str) -> Tuple[str, str]:
@@ -398,7 +413,7 @@ def resolve_storage_path(library_root: Path, db_path: Optional[str]) -> Optional
 
 
 def ensure_unique_destination(dest: Path, asset_id: str, reserved: Set[Path]) -> Path:
-    if not dest.exists() and dest not in reserved:
+    if not os.path.lexists(dest) and dest not in reserved:
         reserved.add(dest)
         return dest
 
@@ -406,14 +421,14 @@ def ensure_unique_destination(dest: Path, asset_id: str, reserved: Set[Path]) ->
     parent = dest.parent
     token = hashlib.sha256(asset_id.encode("utf-8")).hexdigest()[:12]
     candidate = parent / f"{stem}__{token}{suffix}"
-    if not candidate.exists() and candidate not in reserved:
+    if not os.path.lexists(candidate) and candidate not in reserved:
         reserved.add(candidate)
         return candidate
 
     index = 2
     while True:
         candidate = parent / f"{stem}__{token}_{index}{suffix}"
-        if not candidate.exists() and candidate not in reserved:
+        if not os.path.lexists(candidate) and candidate not in reserved:
             reserved.add(candidate)
             return candidate
         index += 1
@@ -442,6 +457,21 @@ def validate_destination(output_dir: Path, destination: Path) -> None:
         raise UnsafePathError(
             f"Export destination resolves outside output directory: {destination}"
         ) from exc
+
+
+def ensure_separate_trees(library_root: Path, output_dir: Path) -> None:
+    try:
+        output_dir.relative_to(library_root)
+    except ValueError:
+        pass
+    else:
+        raise UnsafePathError("Output directory overlaps the source library")
+
+    try:
+        library_root.relative_to(output_dir)
+    except ValueError:
+        return
+    raise UnsafePathError("Output directory overlaps the source library")
 
 
 def copy_with_metadata(
@@ -541,6 +571,8 @@ def export_assets(args: argparse.Namespace) -> int:
     )
     output_dir = args.output.resolve()
 
+    ensure_separate_trees(library_root, output_dir)
+
     if not backup_path.exists():
         raise FileNotFoundError(f"Backup not found: {backup_path}")
 
@@ -550,17 +582,13 @@ def export_assets(args: argparse.Namespace) -> int:
     progress = ProgressReporter(total_assets, enabled=not args.no_progress)
     manifest_csv_rows: List[Dict[str, object]] = []
     manifest_jsonl_rows: List[Dict[str, object]] = []
-    reserved_destinations: Set[Path] = set()
+    manifest_paths = (output_dir / "manifest.csv", output_dir / "manifest.jsonl")
+    reserved_destinations: Set[Path] = set(manifest_paths)
 
-    if not args.dry_run:
-        existing_manifests = [
-            path
-            for path in (output_dir / "manifest.csv", output_dir / "manifest.jsonl")
-            if path.exists()
-        ]
-        if existing_manifests:
-            names = ", ".join(str(path) for path in existing_manifests)
-            raise FileExistsError(f"Refusing to overwrite existing manifest: {names}")
+    existing_manifests = [path for path in manifest_paths if os.path.lexists(path)]
+    if existing_manifests:
+        names = ", ".join(str(path) for path in existing_manifests)
+        raise FileExistsError(f"Refusing to overwrite existing manifest: {names}")
 
     processed = 0
     for asset in iter_copy_rows(backup_path, "asset"):
@@ -647,12 +675,12 @@ def export_assets(args: argparse.Namespace) -> int:
         manifest_jsonl_rows.append(row)
 
         if args.write_json_sidecars:
-            json_dest = final_dest.with_suffix(final_dest.suffix + ".immich.json")
-            if json_dest.exists() or json_dest in reserved_destinations:
-                raise FileExistsError(
-                    f"Refusing to overwrite existing metadata sidecar: {json_dest}"
-                )
-            reserved_destinations.add(json_dest)
+            desired_json_dest = final_dest.with_suffix(
+                final_dest.suffix + ".immich.json"
+            )
+            json_dest = ensure_unique_destination(
+                desired_json_dest, f"{asset_id}:metadata", reserved_destinations
+            )
             validate_destination(output_dir, json_dest)
             write_json(json_dest, row, args.dry_run)
 

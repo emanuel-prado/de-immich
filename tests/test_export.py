@@ -98,6 +98,65 @@ class ExportTests(unittest.TestCase):
         self.assertEqual(manifest.read_text(encoding="utf-8"), "keep me")
         self.assertFalse((output / "same.jpg").exists())
 
+    def test_dry_run_rejects_existing_manifest_like_real_export(self):
+        backup = self._collision_backup()
+        output = self.root / "export"
+        output.mkdir()
+        (output / "manifest.jsonl").write_text("keep me", encoding="utf-8")
+
+        with self.assertRaisesRegex(FileExistsError, "existing manifest"):
+            self.app.export_assets(
+                arguments(self.library, backup, output, dry_run=True)
+            )
+
+    def test_flat_asset_cannot_claim_manifest_filename(self):
+        (self.library / "upload/one.bin").write_bytes(b"one")
+        backup = write_backup(
+            self.root / "backup.sql.gz",
+            [
+                {
+                    "id": "asset-1",
+                    "originalPath": "upload/one.bin",
+                    "originalFileName": "manifest.csv",
+                }
+            ],
+        )
+        output = self.root / "export"
+
+        self.app.export_assets(arguments(self.library, backup, output))
+
+        token = self.app.hashlib.sha256(b"asset-1").hexdigest()[:12]
+        self.assertEqual((output / f"manifest__{token}.csv").read_bytes(), b"one")
+        with (output / "manifest.csv").open(newline="", encoding="utf-8") as handle:
+            self.assertEqual(len(list(csv.DictReader(handle))), 1)
+
+    def test_metadata_sidecar_collision_is_resolved(self):
+        (self.library / "upload/one.bin").write_bytes(b"one")
+        (self.library / "upload/two.bin").write_bytes(b"two")
+        backup = write_backup(
+            self.root / "backup.sql.gz",
+            [
+                {
+                    "id": "asset-1",
+                    "originalPath": "upload/one.bin",
+                    "originalFileName": "photo.jpg.immich.json",
+                },
+                {
+                    "id": "asset-2",
+                    "originalPath": "upload/two.bin",
+                    "originalFileName": "photo.jpg",
+                },
+            ],
+        )
+        output = self.root / "export"
+
+        self.app.export_assets(
+            arguments(self.library, backup, output, write_json_sidecars=True)
+        )
+
+        token = self.app.hashlib.sha256(b"asset-2:metadata").hexdigest()[:12]
+        self.assertTrue((output / f"photo__{token}.jpg.immich.json").is_file())
+
     def test_unused_unsafe_sidecar_path_does_not_block_original(self):
         source = self.library / "upload/one.bin"
         source.write_bytes(b"one")
