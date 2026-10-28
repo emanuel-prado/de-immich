@@ -251,6 +251,32 @@ class ExportTests(unittest.TestCase):
 
         self.assertEqual(self.app.verify_manifest(output / "manifest.jsonl"), 2)
 
+    def test_manifest_verification_rejects_unsubstantiated_failure_status(self):
+        exported = self.root / "asset.jpg"
+        exported.write_bytes(b"asset")
+        digest = self.app.sha256_file(exported)
+        manifest = self.root / "manifest.jsonl"
+        manifest.write_text(
+            json.dumps(
+                {
+                    "reportSchemaVersion": self.app.REPORT_SCHEMA_VERSION,
+                    "status": "verification-failed",
+                    "fixityAlgorithm": "sha256",
+                    "sourceSha256": digest,
+                    "exportedSha256": digest,
+                    "verification": "verified",
+                    "exportedPath": str(exported),
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(
+            self.app.BackupFormatError, "without a failed outcome"
+        ):
+            self.app.verify_manifest(manifest)
+
     def test_skipped_assets_are_recorded(self):
         backup = write_backup(
             self.root / "skips.sql.gz",
