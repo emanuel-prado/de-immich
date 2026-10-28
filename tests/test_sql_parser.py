@@ -60,6 +60,19 @@ class SqlParserTests(unittest.TestCase):
         with self.assertRaisesRegex(self.app.BackupFormatError, "1 fields; expected 3"):
             list(self.app.iter_copy_rows(backup, "asset"))
 
+    def test_crlf_copy_rows_and_terminator_are_supported(self):
+        backup = self.root / "crlf.sql.gz"
+        with gzip.open(backup, "wb") as handle:
+            handle.write(
+                b'COPY public.asset ("id", "originalPath", "originalFileName") FROM stdin;\r\n'
+                b'asset-1\tupload/one.jpg\tone.jpg\r\n'
+                b'\\.\r\n'
+            )
+
+        rows = list(self.app.iter_copy_rows(backup, "asset"))
+
+        self.assertEqual(rows[0]["originalFileName"], "one.jpg")
+
 
 if __name__ == "__main__":
     unittest.main()
