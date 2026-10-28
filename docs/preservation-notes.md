@@ -76,9 +76,11 @@ backup + storage copy (read only)
 
 Path traversal, source or destination symlink components, non-regular sources,
 missing COPY sections, null asset IDs, missing required columns, and malformed
-field counts fail closed. Collision suffixes use bounded hashes rather than raw
-identifiers and are reserved so dry-run and export agree when they start from the
-same filesystem state. An interrupted run retains `manifest.jsonl.partial`.
+field counts fail closed. Source and output trees may not overlap. Tool report
+names and asset destinations are reserved before use; collision suffixes and
+overlong-name reductions use bounded hashes so dry-run and export agree when
+they start from the same filesystem state. An interrupted run retains
+`manifest.jsonl.partial`.
 
 ## Remaining preservation safeguards
 

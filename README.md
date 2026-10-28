@@ -27,8 +27,8 @@ and produces inspectable CSV and JSONL recovery reports.
 | Capability | Current behavior |
 | --- | --- |
 | Original recovery | Copies `asset.originalPath` using `originalFileName` |
-| Safe planning | Rejects source/destination traversal, symlinked path components, malformed rows, and missing required schema |
-| Collisions | Uses bounded hashes of asset IDs and reserves names within a run; dry-run and export use the same plan against the same starting state |
+| Safe planning | Rejects overlapping source/output trees, traversal, symlinked path components, malformed rows, and missing required schema |
+| Collisions | Reserves tool-owned and asset names, bounds long filenames, and uses hashed suffixes; dry-run and export use the same plan against the same starting state |
 | Fixity | Records source/output SHA-256 and verifies the published copy |
 | Later verification | Re-reads exports and rejects corruption, absence, symlink substitution, unsupported reports, and previously recorded copy failures |
 | Auditability | Records exported, missing, and skipped outcomes; retains a partial JSONL journal after interruption |
@@ -64,8 +64,10 @@ python3 de-immich.py \
 ```
 
 When run from the Immich storage root, `--library-root` and `--backup` may be
-omitted. The script selects the last filename in sorted `backups/*.sql.gz`; pass
-`--backup` explicitly when that convention is not reliable for your files.
+omitted. `--output` must still name a separate tree, not the storage root or one
+of its descendants. The script selects the last filename in sorted
+`backups/*.sql.gz`; pass `--backup` explicitly when that convention is not
+reliable for your files.
 
 ```text
 recovered-media/
@@ -99,6 +101,9 @@ python3 de-immich.py --help
   symlinks, and non-regular files fail closed.
 - Destination parents are checked for containment and symlinks, and untrusted
   asset IDs are represented by bounded hash tokens in collision filenames.
+- Tool-owned report paths are reserved before assets are planned. Overlong
+  UTF-8 names are deterministically shortened with a hash instead of failing at
+  publication time.
 - Files are copied to a same-directory temporary file and published without an
   overwrite operation.
 - SHA-256 is calculated from bytes read from the source and independently from
