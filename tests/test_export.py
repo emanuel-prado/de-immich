@@ -1,0 +1,544 @@
+import argparse
+import csv
+import gzip
+import json
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+from helpers import write_backup
+from load_app import load_app
+
+
+def arguments(library, backup, output, **overrides):
+    values = {
+        "library_root": library,
+        "backup": backup,
+        "output": output,
+        "flat": True,
+        "include_deleted": False,
+        "include_offline": False,
+        "copy_sidecars": False,
+        "write_json_sidecars": False,
+        "limit": None,
+        "dry_run": False,
+        "no_progress": True,
+    }
+    values.update(overrides)
+    return argparse.Namespace(**values)
+
+
+class ExportTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = load_app()
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.library = self.root / "library"
+        (self.library / "upload").mkdir(parents=True)
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def _collision_backup(self):
+        (self.library / "upload/one.bin").write_bytes(b"one")
+        (self.library / "upload/two.bin").write_bytes(b"two")
+        return write_backup(
+            self.root / "backup.sql.gz",
+            [
+                {"id": "aaaaaaaa-1", "originalPath": "upload/one.bin", "originalFileName": "same.jpg"},
+                {"id": "bbbbbbbb-2", "originalPath": "upload/two.bin", "originalFileName": "same.jpg"},
+                {"id": "cccccccc-3", "originalPath": "upload/missing.bin", "originalFileName": "missing.jpg"},
+            ],
+        )
+
+    def test_export_handles_collisions_and_records_missing_source(self):
+        backup = self._collision_backup()
+        output = self.root / "export"
+        self.assertEqual(self.app.export_assets(arguments(self.library, backup, output)), 0)
+        self.assertEqual((output / "same.jpg").read_bytes(), b"one")
+        token = self.app.hashlib.sha256(b"bbbbbbbb-2").hexdigest()[:12]
+        self.assertEqual((output / f"same__{token}.jpg").read_bytes(), b"two")
+        with (output / "manifest.csv").open(newline="", encoding="utf-8") as handle:
+            rows = list(csv.DictReader(handle))
+        self.assertEqual([row["status"] for row in rows], ["exported", "exported", "missing-source"])
+        self.assertEqual(rows[0]["verification"], "verified")
+        self.assertEqual(rows[0]["sourceSha256"], rows[0]["exportedSha256"])
+        self.assertEqual(len(rows[0]["sourceSha256"]), 64)
+        self.assertFalse((output / "manifest.jsonl.partial").exists())
+
+    def test_dry_run_reserves_the_same_collision_destinations(self):
+        backup = self._collision_backup()
+        destinations = []
+
+        def record_copy(source, destination, timestamp, dry_run):
+            destinations.append(destination.name)
+            return None, None
+
+        with mock.patch.object(self.app, "copy_with_metadata", side_effect=record_copy):
+            self.app.export_assets(arguments(self.library, backup, self.root / "export", dry_run=True))
+        token = self.app.hashlib.sha256(b"bbbbbbbb-2").hexdigest()[:12]
+        self.assertEqual(destinations, ["same.jpg", f"same__{token}.jpg"])
+
+    def test_atomic_copy_refuses_overwrite(self):
+        source = self.root / "source"
+        destination = self.root / "destination"
+        source.write_bytes(b"new")
+        destination.write_bytes(b"existing")
+        with self.assertRaises(FileExistsError):
+            self.app.copy_with_metadata(source, destination, None, False)
+        self.assertEqual(destination.read_bytes(), b"existing")
+
+    def test_existing_manifest_stops_export_before_copying(self):
+        backup = self._collision_backup()
+        output = self.root / "export"
+        output.mkdir()
+        manifest = output / "manifest.csv"
+        manifest.write_text("keep me", encoding="utf-8")
+
+        with self.assertRaisesRegex(FileExistsError, "existing manifest"):
+            self.app.export_assets(arguments(self.library, backup, output))
+
+        self.assertEqual(manifest.read_text(encoding="utf-8"), "keep me")
+        self.assertFalse((output / "same.jpg").exists())
+
+    def test_dry_run_rejects_existing_manifest_like_real_export(self):
+        backup = self._collision_backup()
+        output = self.root / "export"
+        output.mkdir()
+        (output / "manifest.jsonl").write_text("keep me", encoding="utf-8")
+
+        with self.assertRaisesRegex(FileExistsError, "existing manifest"):
+            self.app.export_assets(
+                arguments(self.library, backup, output, dry_run=True)
+            )
+
+    def test_flat_asset_cannot_claim_manifest_filename(self):
+        (self.library / "upload/one.bin").write_bytes(b"one")
+        backup = write_backup(
+            self.root / "backup.sql.gz",
+            [
+                {
+                    "id": "asset-1",
+                    "originalPath": "upload/one.bin",
+                    "originalFileName": "manifest.csv",
+                }
+            ],
+        )
+        output = self.root / "export"
+
+        self.app.export_assets(arguments(self.library, backup, output))
+
+        token = self.app.hashlib.sha256(b"asset-1").hexdigest()[:12]
+        self.assertEqual((output / f"manifest__{token}.csv").read_bytes(), b"one")
+        with (output / "manifest.csv").open(newline="", encoding="utf-8") as handle:
+            self.assertEqual(len(list(csv.DictReader(handle))), 1)
+
+    def test_metadata_sidecar_collision_is_resolved(self):
+        (self.library / "upload/one.bin").write_bytes(b"one")
+        (self.library / "upload/two.bin").write_bytes(b"two")
+        backup = write_backup(
+            self.root / "backup.sql.gz",
+            [
+                {
+                    "id": "asset-1",
+                    "originalPath": "upload/one.bin",
+                    "originalFileName": "photo.jpg.immich.json",
+                },
+                {
+                    "id": "asset-2",
+                    "originalPath": "upload/two.bin",
+                    "originalFileName": "photo.jpg",
+                },
+            ],
+        )
+        output = self.root / "export"
+
+        self.app.export_assets(
+            arguments(self.library, backup, output, write_json_sidecars=True)
+        )
+
+        token = self.app.hashlib.sha256(b"asset-2:metadata").hexdigest()[:12]
+        self.assertTrue((output / f"photo__{token}.jpg.immich.json").is_file())
+
+    def test_manifest_verification_detects_corruption(self):
+        backup = self._collision_backup()
+        output = self.root / "export"
+        self.app.export_assets(arguments(self.library, backup, output))
+
+        self.assertEqual(self.app.verify_manifest(output / "manifest.jsonl"), 0)
+        (output / "same.jpg").write_bytes(b"corrupt")
+        self.assertEqual(self.app.verify_manifest(output / "manifest.jsonl"), 2)
+
+    def test_manifest_verification_preserves_recorded_copy_failure(self):
+        backup = self._collision_backup()
+        output = self.root / "export"
+        self.app.export_assets(arguments(self.library, backup, output))
+        manifest = output / "manifest.jsonl"
+        rows = [json.loads(line) for line in manifest.read_text().splitlines()]
+        rows[0]["verification"] = "failed"
+        rows[0]["sourceSha256"] = "0" * 64
+        manifest.write_text(
+            "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+        )
+
+        self.assertEqual(self.app.verify_manifest(manifest), 2)
+
+    def test_manifest_verification_rejects_unknown_schema(self):
+        manifest = self.root / "manifest.jsonl"
+        manifest.write_text(
+            json.dumps({"reportSchemaVersion": "99.0"}) + "\n",
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(
+            self.app.BackupFormatError, "unsupported report schema"
+        ):
+            self.app.verify_manifest(manifest)
+
+    def test_manifest_verification_rejects_export_without_fixity(self):
+        manifest = self.root / "manifest.jsonl"
+        manifest.write_text(
+            json.dumps(
+                {"reportSchemaVersion": self.app.REPORT_SCHEMA_VERSION, "status": "exported"}
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(
+            self.app.BackupFormatError, "incomplete fixity record"
+        ):
+            self.app.verify_manifest(manifest)
+
+    def test_manifest_verification_rejects_invalid_fixity_contract(self):
+        exported = self.root / "asset.jpg"
+        exported.write_bytes(b"asset")
+        digest = self.app.sha256_file(exported)
+        base = {
+            "reportSchemaVersion": self.app.REPORT_SCHEMA_VERSION,
+            "status": "exported",
+            "fixityAlgorithm": "sha256",
+            "sourceSha256": digest,
+            "exportedSha256": digest,
+            "verification": "verified",
+            "exportedPath": str(exported),
+        }
+
+        for field, value, message in (
+            ("fixityAlgorithm", "md5", "invalid fixity algorithm"),
+            ("verification", "banana", "invalid verification outcome"),
+            ("status", "unknown", "invalid status"),
+        ):
+            with self.subTest(field=field):
+                manifest = self.root / f"{field}.jsonl"
+                row = {**base, field: value}
+                manifest.write_text(json.dumps(row) + "\n", encoding="utf-8")
+                with self.assertRaisesRegex(self.app.BackupFormatError, message):
+                    self.app.verify_manifest(manifest)
+
+    def test_manifest_verification_accepts_schema_1_0_without_sidecar_fixity(self):
+        exported = self.root / "asset.jpg"
+        exported.write_bytes(b"asset")
+        digest = self.app.sha256_file(exported)
+        manifest = self.root / "manifest.jsonl"
+        manifest.write_text(
+            json.dumps(
+                {
+                    "reportSchemaVersion": "1.0",
+                    "status": "exported",
+                    "fixityAlgorithm": "sha256",
+                    "exportedPath": str(exported),
+                    "sourceSha256": digest,
+                    "exportedSha256": digest,
+                    "verification": "verified",
+                    "exportedSidecarPath": str(self.root / "legacy.xmp"),
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        self.assertEqual(self.app.verify_manifest(manifest), 0)
+
+    def test_manifest_verification_rejects_unsubstantiated_failure_status(self):
+        exported = self.root / "asset.jpg"
+        exported.write_bytes(b"asset")
+        digest = self.app.sha256_file(exported)
+        manifest = self.root / "manifest.jsonl"
+        manifest.write_text(
+            json.dumps(
+                {
+                    "reportSchemaVersion": self.app.REPORT_SCHEMA_VERSION,
+                    "status": "verification-failed",
+                    "fixityAlgorithm": "sha256",
+                    "sourceSha256": digest,
+                    "exportedSha256": digest,
+                    "verification": "verified",
+                    "exportedPath": str(exported),
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(
+            self.app.BackupFormatError, "without a failed outcome"
+        ):
+            self.app.verify_manifest(manifest)
+
+    def test_manifest_verification_requires_schema_1_1_sidecar_fixity(self):
+        exported = self.root / "asset.jpg"
+        exported.write_bytes(b"asset")
+        digest = self.app.sha256_file(exported)
+        manifest = self.root / "manifest.jsonl"
+        manifest.write_text(
+            json.dumps(
+                {
+                    "reportSchemaVersion": self.app.REPORT_SCHEMA_VERSION,
+                    "status": "exported",
+                    "exportedPath": str(exported),
+                    "sourceSha256": digest,
+                    "exportedSha256": digest,
+                    "verification": "verified",
+                    "exportedSidecarPath": str(self.root / "sidecar.xmp"),
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(
+            self.app.BackupFormatError, "incomplete sidecar fixity"
+        ):
+            self.app.verify_manifest(manifest)
+
+    def test_manifest_verification_rejects_symlink_substitution(self):
+        backup = self._collision_backup()
+        output = self.root / "export"
+        self.app.export_assets(arguments(self.library, backup, output))
+        exported = output / "same.jpg"
+        replacement = self.root / "replacement.jpg"
+        replacement.write_bytes(exported.read_bytes())
+        exported.unlink()
+        exported.symlink_to(replacement)
+
+        self.assertEqual(self.app.verify_manifest(output / "manifest.jsonl"), 2)
+
+    def test_skipped_assets_are_recorded(self):
+        backup = write_backup(
+            self.root / "skips.sql.gz",
+            [
+                {"id": "deleted", "originalPath": "upload/a", "originalFileName": "a.jpg", "deletedAt": "2026-01-01 00:00:00+00"},
+                {"id": "offline", "originalPath": "upload/b", "originalFileName": "b.jpg", "isOffline": "t"},
+                {"id": "unnamed", "originalPath": "upload/c", "originalFileName": None},
+            ],
+        )
+        output = self.root / "export"
+
+        self.app.export_assets(arguments(self.library, backup, output))
+
+        with (output / "manifest.csv").open(newline="", encoding="utf-8") as handle:
+            statuses = [row["status"] for row in csv.DictReader(handle)]
+        self.assertEqual(
+            statuses,
+            ["skipped-deleted", "skipped-offline", "skipped-missing-name"],
+        )
+
+    def test_interrupted_export_retains_completed_journal_rows(self):
+        backup = self._collision_backup()
+        output = self.root / "export"
+        calls = 0
+
+        def interrupt_second_copy(source, destination, timestamp, dry_run):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise OSError("simulated interruption")
+            return "a" * 64, "a" * 64
+
+        with mock.patch.object(
+            self.app, "copy_with_metadata", side_effect=interrupt_second_copy
+        ):
+            with self.assertRaisesRegex(OSError, "simulated interruption"):
+                self.app.export_assets(arguments(self.library, backup, output))
+
+        partial = output / "manifest.jsonl.partial"
+        self.assertTrue(partial.exists())
+        self.assertEqual(len(partial.read_text(encoding="utf-8").splitlines()), 1)
+        self.assertFalse((output / "manifest.jsonl").exists())
+
+    def test_unused_unsafe_sidecar_path_does_not_block_original(self):
+        source = self.library / "upload/one.bin"
+        source.write_bytes(b"one")
+        backup = write_backup(
+            self.root / "backup.sql.gz",
+            [
+                {
+                    "id": "asset-1",
+                    "originalPath": "upload/one.bin",
+                    "originalFileName": "one.jpg",
+                    "sidecarPath": "../../outside.xmp",
+                }
+            ],
+        )
+        output = self.root / "export"
+
+        self.assertEqual(
+            self.app.export_assets(arguments(self.library, backup, output)), 0
+        )
+        self.assertEqual((output / "one.jpg").read_bytes(), b"one")
+
+    def test_asset_without_id_is_rejected(self):
+        backup = write_backup(
+            self.root / "backup.sql.gz",
+            [
+                {
+                    "id": None,
+                    "originalPath": "upload/one.bin",
+                    "originalFileName": "one.jpg",
+                }
+            ],
+        )
+
+        with self.assertRaisesRegex(self.app.BackupFormatError, "row 1 has no id"):
+            self.app.export_assets(
+                arguments(self.library, backup, self.root / "export")
+            )
+
+    def test_sidecar_directory_is_rejected(self):
+        (self.library / "upload/one.bin").write_bytes(b"one")
+        (self.library / "upload/not-a-file").mkdir()
+        backup = write_backup(
+            self.root / "backup.sql.gz",
+            [
+                {
+                    "id": "asset-1",
+                    "originalPath": "upload/one.bin",
+                    "originalFileName": "one.jpg",
+                    "sidecarPath": "upload/not-a-file",
+                }
+            ],
+        )
+
+        with self.assertRaisesRegex(
+            self.app.UnsafePathError, "Sidecar source is not a regular file"
+        ):
+            self.app.export_assets(
+                arguments(
+                    self.library,
+                    backup,
+                    self.root / "export",
+                    copy_sidecars=True,
+                )
+            )
+
+    def test_current_asset_file_sidecar_is_copied_beside_original(self):
+        (self.library / "upload/one.jpg").write_bytes(b"image")
+        (self.library / "upload/random.xmp").write_bytes(b"metadata")
+        backup = write_backup(
+            self.root / "backup.sql.gz",
+            [
+                {
+                    "id": "asset-1",
+                    "originalPath": "upload/one.jpg",
+                    "originalFileName": "meaningful.jpg",
+                }
+            ],
+            asset_files=[
+                {"assetId": "asset-1", "type": "sidecar", "path": "upload/random.xmp"},
+                {"assetId": "asset-1", "type": "thumbnail", "path": "thumbs/ignored.webp"},
+            ],
+        )
+        output = self.root / "export"
+
+        self.assertEqual(
+            self.app.export_assets(
+                arguments(self.library, backup, output, copy_sidecars=True)
+            ),
+            0,
+        )
+        self.assertEqual((output / "meaningful.jpg").read_bytes(), b"image")
+        self.assertEqual(
+            (output / "meaningful.jpg.xmp").read_bytes(), b"metadata"
+        )
+        row = json.loads((output / "manifest.jsonl").read_text().splitlines()[0])
+        self.assertEqual(row["sidecarPath"], "upload/random.xmp")
+        self.assertEqual(row["exportedSidecarPath"], str(output / "meaningful.jpg.xmp"))
+        self.assertEqual(row["sidecarVerification"], "verified")
+        self.assertEqual(row["sidecarSourceSha256"], row["sidecarExportedSha256"])
+        self.assertEqual(self.app.verify_manifest(output / "manifest.jsonl"), 0)
+        (output / "meaningful.jpg.xmp").write_bytes(b"corrupt")
+        self.assertEqual(self.app.verify_manifest(output / "manifest.jsonl"), 2)
+
+    def test_multiple_current_sidecars_are_rejected(self):
+        backup = write_backup(
+            self.root / "backup.sql.gz",
+            [
+                {
+                    "id": "asset-1",
+                    "originalPath": "upload/one.jpg",
+                    "originalFileName": "one.jpg",
+                }
+            ],
+            asset_files=[
+                {"assetId": "asset-1", "type": "sidecar", "path": "upload/one.xmp"},
+                {"assetId": "asset-1", "type": "sidecar", "path": "upload/two.xmp"},
+            ],
+        )
+
+        with self.assertRaisesRegex(
+            self.app.BackupFormatError, "multiple sidecars"
+        ):
+            self.app.export_assets(
+                arguments(
+                    self.library,
+                    backup,
+                    self.root / "export",
+                    copy_sidecars=True,
+                )
+            )
+
+    def test_unused_asset_file_schema_does_not_block_original_recovery(self):
+        (self.library / "upload/one.jpg").write_bytes(b"image")
+        backup = write_backup(
+            self.root / "backup.sql.gz",
+            [
+                {
+                    "id": "asset-1",
+                    "originalPath": "upload/one.jpg",
+                    "originalFileName": "one.jpg",
+                }
+            ],
+        )
+        with gzip.open(backup, "at", encoding="utf-8") as handle:
+            handle.write(
+                'COPY public.asset_file ("assetId", "type") FROM stdin;\n'
+                'asset-1\tsidecar\n'
+                '\\.\n'
+            )
+
+        self.assertEqual(
+            self.app.export_assets(
+                arguments(self.library, backup, self.root / "original-only")
+            ),
+            0,
+        )
+        with self.assertRaisesRegex(
+            self.app.BackupFormatError, "missing required columns: path"
+        ):
+            self.app.export_assets(
+                arguments(
+                    self.library,
+                    backup,
+                    self.root / "with-sidecars",
+                    copy_sidecars=True,
+                )
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()
